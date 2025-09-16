@@ -31,7 +31,7 @@ load_dotenv(dotenv_path, override=True)
 
 # Supabase-Konfiguration (Service-Role-Key!)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # angepasst an .env
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
 
 # Lazy-init placeholder
 global_supabase = None
@@ -40,9 +40,9 @@ global_supabase = None
 def get_supabase_client():
     global global_supabase
     if global_supabase is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise SupabaseException("SUPABASE_URL und SUPABASE_KEY müssen gesetzt sein")
-        global_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            raise SupabaseException("SUPABASE_URL und SUPABASE_SERVICE_ROLE_KEY müssen gesetzt sein")
+        global_supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     return global_supabase
 
 

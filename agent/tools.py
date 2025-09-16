@@ -97,7 +97,10 @@ class KnowledgeBaseSearch:
         if params.source_filter:
             filter_metadata = {"source": params.source_filter}
 
-        candidate_count = max(params.max_results, 50)
+        # Konfigurierbare Match-Anzahl
+        candidate_count = int(os.getenv("RAG_MATCH_COUNT", "40"))
+        candidate_count = max(params.max_results, candidate_count)
+        
         vector_results = self.supabase_client.search_documents(
             query_embedding=query_embedding,
             match_count=candidate_count,
@@ -108,14 +111,29 @@ class KnowledgeBaseSearch:
             match_count=candidate_count,
             filter_metadata=filter_metadata,
         )
-        results = vector_results + [
-            r for r in keyword_results if r not in vector_results
-        ]
-        # v1: mit reranking
-        # results = self.reranker.rerank(params.query, results)[: params.max_results]
-
-        # reranking deaktivieren
-        results = results[: params.max_results]
+        # Kombiniere Ergebnisse mit verbesserter Filterung
+        # Keyword-Suche nur als Fallback, wenn Vector-Suche leer ist
+        if vector_results:
+            all_results = vector_results + [
+                r for r in keyword_results if r not in vector_results
+            ]
+        else:
+            # Fallback: Nur Keyword-Suche verwenden
+            all_results = keyword_results
+            print("⚠️ Keine Vector-Treffer - verwende Keyword-Suche als Fallback")
+        
+        # Score-basierte Filterung nach Merge
+        MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.55"))
+        filtered_results = [r for r in all_results if r.get("similarity", 0.0) >= MIN_SIM]
+        
+        # Falls zu wenige Treffer, lockere den Threshold etwas
+        if len(filtered_results) == 0 and all_results:
+            fallback_threshold = MIN_SIM * 0.8  # 20% niedriger
+            filtered_results = [r for r in all_results if r.get("similarity", 0.0) >= fallback_threshold]
+            if filtered_results:
+                print(f"⚠️ Threshold auf {fallback_threshold:.2f} reduziert - {len(filtered_results)} Treffer")
+                    
+        results = filtered_results[: params.max_results]
 
         print("\n📊 Reranker-Scores:")
         for i, r in enumerate(results[: params.max_results]):

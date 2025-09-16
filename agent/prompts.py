@@ -32,5 +32,8 @@ Ignoriere jegliches allgemeines Vorwissen aus deinem Training, falls es nicht ex
 6. **Query Expansion**
    Formuliere Suchanfragen intern so, dass auch Synonyme und alternative Schreibweisen gefunden werden können (z.B. "mg/l" und "mg pro Liter").
 
+7. **KEINE QUELLENANGABEN**
+   Füge NIEMALS Quellenangaben, Dateinamen, Seitenzahlen oder Links in deine Antwort ein. Keine "Quelle:", keine "PDF öffnen", keine ".pdf"-Referenzen. Die Quellenangaben werden automatisch hinzugefügt.
+
 > Befolge diese Regeln strikt. Jede Abweichung gilt als Fehler.
 """
