@@ -23,14 +23,14 @@ class SupabaseClient:
 
     Args:
         supabase_url: URL for Supabase instance. Defaults to SUPABASE_URL env var.
-        supabase_key: API key for Supabase. Defaults to SUPABASE_KEY env var.
+        supabase_key: API key for Supabase. Defaults to SUPABASE_SERVICE_ROLE_KEY env var.
     """
 
     def __init__(
         self, supabase_url: Optional[str] = None, supabase_key: Optional[str] = None
     ):
         self.supabase_url = supabase_url or os.getenv("SUPABASE_URL")
-        self.supabase_key = supabase_key or os.getenv("SUPABASE_KEY")
+        self.supabase_key = supabase_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
 
         if not self.supabase_url or not self.supabase_key:
             raise ValueError(
@@ -108,7 +108,8 @@ class SupabaseClient:
         match_count: int = 5,
         filter_metadata: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        match_threshold = float(os.getenv("MIN_SIMILARITY_SCORE", "0.5"))
+        # Konfigurierbare Mindest-Similarity
+        match_threshold = float(os.getenv("RAG_MIN_SIM", "0.55"))
 
         params = {
             "query_embedding": query_embedding,
@@ -125,13 +126,16 @@ class SupabaseClient:
                 print("⚠️ Keine Dokument-Treffer für die Anfrage gefunden.")
                 return []
 
-            print(f"\n🔍 Top {len(result.data)} RAG-Matches:")
-            for r in result.data:
+            # Zusätzliche lokale Filterung nach Similarity
+            filtered_results = [r for r in result.data if r.get("similarity", 0) >= match_threshold]
+
+            print(f"\n🔍 Top {len(filtered_results)} RAG-Matches (von {len(result.data)} gefiltert):")
+            for r in filtered_results:
                 score = r.get("similarity", 0.0)
                 preview = r["content"][:120].replace("\n", " ")
                 print(f"  • Score: {score:.3f} → {preview}...")
 
-            return result.data
+            return filtered_results
 
         except Exception as e:
             print("❌ Fehler bei Supabase-RPC:", str(e))

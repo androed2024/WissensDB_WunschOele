@@ -1,10 +1,26 @@
-.env
+# Python
 __pycache__/
 *.pyc
-.DS_Store
-*.log
+*.pyo
+*.pyd
 
-# virtuelle Envs
-venv/
+# Virtual env
 .venv/
+venv/
+
+# Env files
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Caches
+.pytest_cache/
+
+# Streamlit
+.streamlit/
+
+# Logs
+*.log
 

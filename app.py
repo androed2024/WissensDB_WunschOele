@@ -44,6 +44,7 @@ import hashlib
 def compute_file_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
+
 from collections import defaultdict
 
 # Logo-Pfad im Root-Verzeichnis
@@ -52,6 +53,7 @@ logo_path = "logo-wunschoele.png"
 # Logo-Datei als base64 laden
 with open(logo_path, "rb") as image_file:
     encoded = b64encode(image_file.read()).decode()
+
 
 def sanitize_filename(filename: str) -> str:
     filename = filename.strip()
@@ -71,15 +73,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import mimetypes
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+
 app_version = os.getenv("APP_VERSION", "0.0")
 print("DEBUG VERSION:", os.getenv("APP_VERSION"))
 
-from utils.supabase_client import client
-from utils.delete_helper import delete_file_and_records
-
 from document_processing.ingestion import DocumentIngestionPipeline
 from database.setup import SupabaseClient
-from agent.agent import RAGAgent, agent as rag_agent, format_source_reference
+from agent.agent import RAGAgent, agent as rag_agent, format_source_reference, get_supabase_client
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -95,29 +100,33 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Responsive Kopfzeile mit Logo, Titel, Version und Zähler
-st.markdown(
-    f"""
-    <style>
-        @media (max-width: 768px) {{
-            .header-flex {{ flex-direction: column; align-items: flex-start; gap: 0.4rem; }}
-            .header-title-wrap {{ flex-direction: column; align-items: flex-start; }}
-        }}
-    </style>
-    <div class=\"header-flex\" style=\"display: flex; justify-content: space-between; align-items: center; padding-top: 0.5rem; padding-bottom: 0.5rem;\">
-        <div class=\"header-title-wrap\" style=\"display: flex; align-items: center;\">
-            <img src=\"data:image/png;base64,{encoded}\" alt=\"Logo\" style=\"height: 42px; margin-right: 14px;\">
-            <span style=\"font-size: 22px; font-weight: 600;\">Wunsch-Öle Wissens Agent</span>
-            <span style=\"color: #007BFF; font-size: 14px; margin-left: 12px;\">🔧 Version: {app_version}</span>
+def render_header():
+    """Rendert den Header mit aktuellen Dokumenten- und Notizenzählern"""
+    doc_count = st.session_state.get("document_count", 0)
+    note_count = st.session_state.get("knowledge_count", 0)
+    
+    st.markdown(
+        f"""
+        <style>
+            @media (max-width: 768px) {{
+                .header-flex {{ flex-direction: column; align-items: flex-start; gap: 0.4rem; }}
+                .header-title-wrap {{ flex-direction: column; align-items: flex-start; }}
+            }}
+        </style>
+        <div class=\"header-flex\" style=\"display: flex; justify-content: space-between; align-items: center; padding-top: 0.5rem; padding-bottom: 0.5rem;\">
+            <div class=\"header-title-wrap\" style=\"display: flex; align-items: center;\">
+                <img src=\"data:image/png;base64,{encoded}\" alt=\"Logo\" style=\"height: 42px; margin-right: 14px;\">
+                <span style=\"font-size: 22px; font-weight: 600;\">Wunsch-Öle Wissens Agent</span>
+                <span style=\"color: #007BFF; font-size: 14px; margin-left: 12px;\">🔧 Version: {app_version}</span>
+            </div>
+            <div style=\"font-size: 14px;\">
+                📄 Dokumente: {doc_count} &nbsp;&nbsp;&nbsp; 🧠 Notizen: {note_count}
+            </div>
         </div>
-        <div style=\"font-size: 14px;\">
-            📄 Dokumente: {st.session_state.get("document_count", 0)} &nbsp;&nbsp;&nbsp; 🧠 Notizen: {st.session_state.get("knowledge_count", 0)}
-        </div>
-    </div>
-    <hr style=\"margin-top: 0.4rem; margin-bottom: 0.8rem;\">
-    """,
-    unsafe_allow_html=True
-)
+        <hr style=\"margin-top: 0.4rem; margin-bottom: 0.8rem;\">
+        """,
+        unsafe_allow_html=True,
+    )
 
 supabase_client = SupabaseClient()
 
@@ -200,7 +209,9 @@ async def run_agent_with_streaming(user_input: str):
 
 async def update_available_sources():
     try:
-        response = client.table("rag_pages").select("url, metadata").execute()
+        response = (
+            supabase_client.client.table("rag_pages").select("url, metadata").execute()
+        )
 
         file_set = set()
         knowledge_set = set()
@@ -237,9 +248,9 @@ async def update_available_sources():
 
 
 async def main():
-    # Logo + Titel anzeigen
-    
+    # Erst Daten laden, dann Header rendern
     await update_available_sources()
+    render_header()
 
     doc_count = st.session_state.get("document_count", 0)
     note_count = st.session_state.get("knowledge_count", 0)
@@ -298,28 +309,126 @@ async def main():
                     full_response += chunk
                     message_placeholder.markdown(full_response + "▌")
 
-                # Chatbot Interface
+                # Chatbot Interface - Quellenangaben verarbeiten
+                pdf_sources = defaultdict(set)
+                note_sources = defaultdict(set)
+                
                 if hasattr(rag_agent, "last_match") and rag_agent.last_match:
-                    source_pages = defaultdict(set)
                     print("--- Treffer im Retrieval ---")
+                    # Score-basierte Filterung für Anzeige
+                    DISPLAY_MIN_SIM = float(os.getenv("RAG_DISPLAY_MIN_SIM", "0.50"))
+                    
                     for match in rag_agent.last_match:
                         sim = match.get("similarity", 0)
-                        if sim < 0.2:
+                        # Verwende konfigurierbaren Display-Threshold
+                        if sim < DISPLAY_MIN_SIM:
+                            print(f"⚠️ Treffer ignoriert (Score {sim:.3f} < {DISPLAY_MIN_SIM})")
                             continue
+                            
                         meta = match.get("metadata", {})
                         fn = meta.get("original_filename")
                         pg = meta.get("page", 1)
+                        source_type = meta.get("source", "")
+                        
                         if fn:
-                            source_pages[fn].add(pg)
-                            print("✅ Dokument:", fn, "| Seite:", pg, "| Score:", sim)
+                            if source_type == "manuell":
+                                note_sources[fn].add(pg)
+                                print("✅ Notiz:", fn, "| Score:", sim)
+                            else:
+                                pdf_sources[fn].add(pg)
+                                print("✅ Dokument:", fn, "| Seite:", pg, "| Score:", sim)
 
-                if source_pages:
-                    # >>>> Debug-Ausgabe vor Regex <<<<
-                    print("\n--- RAW FULL_RESPONSE VOR CLEANUP ---\n")
-                    print(full_response)
-                    print("\n--- ENDE RAW FULL_RESPONSE ---\n")
-
-                    for fn, pages in sorted(source_pages.items()):
+                # Bereinige die Agent-Antwort von bestehenden Quellenangaben
+                import re
+                
+                # ULTRA-aggressive Bereinigung: Entferne alles ab dem ersten "Quelle"
+                lines = full_response.split('\n')
+                cleaned_lines = []
+                
+                for line in lines:
+                    line_lower = line.lower().strip()
+                    # Stoppe bei jeder Zeile, die "quelle" enthält
+                    if 'quelle' in line_lower or 'pdf öffnen' in line_lower or '.pdf' in line_lower:
+                        break
+                    cleaned_lines.append(line)
+                
+                full_response = '\n'.join(cleaned_lines).strip()
+                
+                # Entferne leere Zeilen am Ende
+                while full_response.endswith('\n\n\n'):
+                    full_response = full_response[:-1]
+                
+                # Füge saubere Quellenangaben hinzu
+                if pdf_sources or note_sources:
+                    full_response += "\n\n---\n"
+                    
+                    # Notizen zuerst anzeigen
+                    for fn, pages in sorted(note_sources.items()):
+                        if not pages:
+                            continue
+                        
+                        # Hole Titel aus den Metadaten der ersten Notiz
+                        try:
+                            # Suche nach der Notiz in den last_match Ergebnissen
+                            note_title = fn  # Fallback
+                            note_filename = fn  # Fallback für Storage-Link
+                            bucket = "privatedocs"  # Default
+                            
+                            if hasattr(rag_agent, "last_match") and rag_agent.last_match:
+                                for match in rag_agent.last_match:
+                                    meta = match.get("metadata", {})
+                                    if (meta.get("source") == "manuell" and 
+                                        (fn in meta.get("original_filename", "") or fn == meta.get("title", ""))):
+                                        note_title = meta.get("title", fn)
+                                        
+                                        # Bestimme den korrekten Dateinamen für Storage-Link
+                                        original_filename = meta.get("original_filename", fn)
+                                        storage_filename = meta.get("storage_filename", original_filename)
+                                        
+                                        # Prüfe, ob es eine alte Notiz ist (ohne .txt Extension)
+                                        if not original_filename.endswith('.txt') and meta.get("source_filter") == "notes":
+                                            # Alte Notiz - keine Storage-Datei verfügbar
+                                            note_filename = None
+                                            bucket = "notes"
+                                        else:
+                                            # Neue Notiz - verwende Storage-Dateinamen
+                                            note_filename = storage_filename or original_filename
+                                            bucket = meta.get("source_filter", "privatedocs")
+                                        break
+                            
+                            # Erstelle signed URL für die Notiz
+                            if note_filename and bucket != "notes":
+                                # Neue Notiz mit Storage-Datei
+                                try:
+                                    client = get_supabase_client()
+                                    res = client.storage.from_(bucket).create_signed_url(note_filename, 3600)
+                                    signed_url = res.get("signedURL", "#")
+                                    
+                                    if signed_url and signed_url != "#":
+                                        print(f"✅ Signed URL für Notiz erstellt: {signed_url[:50]}...")
+                                        full_response += f"\n**📝 Notiz:** {note_title}\n"
+                                        full_response += f"[📄 Notiz öffnen]({signed_url})\n"
+                                    else:
+                                        print(f"⚠️ Keine gültige Signed URL erhalten: {res}")
+                                        full_response += f"\n**📝 Notiz:** {note_title}\n"
+                                        full_response += f"(Link nicht verfügbar)\n"
+                                    
+                                except Exception as e:
+                                    print(f"⚠️ Signed URL für Notiz fehlgeschlagen: {e}")
+                                    full_response += f"\n**📝 Notiz:** {note_title}\n"
+                                    full_response += f"(Link-Fehler)\n"
+                            else:
+                                # Alte Notiz ohne Storage-Datei
+                                print(f"⚠️ Alte Notiz ohne Storage-Link: {note_title}")
+                                full_response += f"\n**📝 Notiz:** {note_title}\n"
+                                full_response += f"(Nur in Datenbank gespeichert)\n"
+                            
+                        except Exception as e:
+                            print(f"⚠️ Fehler beim Verarbeiten der Notiz-Metadaten: {e}")
+                            full_response += f"\n**📝 Notiz:** {fn}\n"
+                    
+                    # Dann PDF-Dokumente
+                    for fn, pages in sorted(pdf_sources.items()):
                         if not pages:
                             continue
                         sorted_pages = sorted(pages)
@@ -327,16 +436,57 @@ async def main():
 
                         meta = {
                             "original_filename": fn,
-                            "page": sorted_pages[0],  # Link zu einer Beispielseite
+                            "page": sorted_pages[0],
                             "source_filter": "privatedocs",
                         }
-                        pdf_link = format_source_reference(meta)
+                        # Hole nur die signed URL, nicht den formatierten Text
+                        client = get_supabase_client()
+                        try:
+                            res = client.storage.from_("privatedocs").create_signed_url(fn, 3600)
+                            signed_url = res.get("signedURL")
+                            if sorted_pages and signed_url:
+                                signed_url += f"#page={sorted_pages[0]}"
+                        except Exception as e:
+                            signed_url = "#"
+                        
+                        full_response += f"\n**📄 Quelle:** {fn}, Seiten {page_list}\n"
+                        full_response += f"[PDF öffnen]({signed_url})\n"
 
-                        # Nutze für den Link etwas wie:
-                        full_response += f"\n**Quelle:** {fn}, Seiten {page_list} [PDF öffnen]({pdf_link})"
-
-                # ✅ Endgültige Antwort anzeigen
-                message_placeholder.markdown(full_response)
+                # ✅ FINALE Bereinigung: Nur unsere Quellen behalten (📄 oder 📝)
+                # Suche nach unseren Markern
+                pdf_parts = full_response.split('**📄 Quelle:**')
+                note_parts = full_response.split('**📝 Notiz:**')
+                
+                if len(pdf_parts) > 1:
+                    # PDF-Quelle gefunden
+                    before_source = pdf_parts[0]
+                    our_source_part = pdf_parts[1]
+                    
+                    # Schneide bei normalem 'Quelle:' ab
+                    quelle_pos = our_source_part.lower().find('quelle:')
+                    if quelle_pos != -1:
+                        our_source_part = our_source_part[:quelle_pos]
+                    
+                    final_response = (before_source + '**📄 Quelle:**' + our_source_part).strip()
+                    
+                elif len(note_parts) > 1:
+                    # Notiz-Quelle gefunden
+                    before_source = note_parts[0]
+                    our_source_part = note_parts[1]
+                    
+                    # Schneide bei normalem 'Quelle:' ab
+                    quelle_pos = our_source_part.lower().find('quelle:')
+                    if quelle_pos != -1:
+                        our_source_part = our_source_part[:quelle_pos]
+                    
+                    final_response = (before_source + '**📝 Notiz:**' + our_source_part).strip()
+                    
+                else:
+                    # Fallback: Entferne alle 'Quelle:' Zeilen
+                    lines = full_response.split('\n')
+                    clean_lines = [line for line in lines if not line.lower().strip().startswith('quelle:')]
+                    final_response = '\n'.join(clean_lines).strip()
+                message_placeholder.markdown(final_response)
 
     with tab2:
         st.markdown("<h4>➕ Wissen hinzufügen</h4>", unsafe_allow_html=True)
@@ -380,7 +530,7 @@ async def main():
                     )
                 else:
                     existing = (
-                        client.table("rag_pages")
+                        supabase_client.client.table("rag_pages")
                         .select("url")
                         .ilike("url", f"{manual_title.strip()}%")
                         .execute()
@@ -396,13 +546,35 @@ async def main():
                             now_berlin = datetime.now(tz_berlin)
                             timestamp = now_berlin.strftime("%Y-%m-%d %H:%M")
                             full_title = f"{manual_title.strip()} ({timestamp})"
+                            
+                            # Erstelle eine Textdatei für die Notiz
+                            note_filename = f"{manual_title.strip()}_{now_berlin.strftime('%Y%m%d_%H%M')}.txt"
+                            note_content = f"Titel: {manual_title.strip()}\nQuelle: {source_type}\nErstellt: {timestamp}\n\n{manual_text}"
+                            
+                            # Speichere Notiz im Storage
+                            try:
+                                supabase_client.client.storage.from_("privatedocs").upload(
+                                    note_filename,
+                                    note_content.encode('utf-8'),
+                                    {
+                                        "cacheControl": "3600",
+                                        "x-upsert": "true",
+                                        "content-type": "text/plain; charset=utf-8",
+                                    },
+                                )
+                                print(f"✅ Notiz im Storage gespeichert: {note_filename}")
+                            except Exception as storage_error:
+                                print(f"⚠️ Storage-Upload fehlgeschlagen: {storage_error}")
+                                # Fahre trotzdem fort - Notiz wird zumindest in der DB gespeichert
+                            
                             metadata = {
                                 "source": "manuell",
                                 "quelle": source_type,
                                 "title": manual_title.strip(),
                                 "upload_time": now_berlin.isoformat(),
-                                "original_filename": manual_title.strip(),
-                                "source_filter": "notes",
+                                "original_filename": note_filename,  # Verwende den Storage-Dateinamen
+                                "source_filter": "privatedocs",  # Gleicher Bucket wie PDFs
+                                "storage_filename": note_filename,  # Zusätzlich für Klarheit
                             }
                             result = pipeline.process_text(
                                 content=manual_text,
@@ -442,7 +614,7 @@ async def main():
 
         # KEIN Button und KEIN upload_clicked mehr!
         uploaded_files = st.file_uploader(
-            label="",
+            label="Dateien hochladen",
             type=["txt", "pdf"],
             accept_multiple_files=True,
             key="uploader_hidden",
@@ -475,7 +647,7 @@ async def main():
 
                     # 🔍 Duplikatprüfung anhand Hash
                     existing_hash = (
-                        client.table("rag_pages")
+                        supabase_client.client.table("rag_pages")
                         .select("id")
                         .eq("metadata->>file_hash", file_hash)
                         .execute()
@@ -489,7 +661,7 @@ async def main():
 
                     # ✅ Duplikatprüfung vor Upload
                     existing = (
-                        client.table("rag_pages")
+                        supabase_client.client.table("rag_pages")
                         .select("id")
                         .eq("url", safe_filename)
                         .execute()
@@ -513,14 +685,19 @@ async def main():
                             f"🟡 **{safe_filename}**: 📥 *Upload startet...*"
                         )
 
+                        # Content-Type dynamisch bestimmen
+                        mime_type, _ = mimetypes.guess_type(safe_filename)
+                        if not mime_type:
+                            mime_type = "application/octet-stream"
+                        
                         with open(temp_file_path, "rb") as f:
-                            client.storage.from_("privatedocs").upload(
+                            supabase_client.client.storage.from_("privatedocs").upload(
                                 safe_filename,
-                                f,
+                                f.read(),  # Bytes, nicht Handle
                                 {
                                     "cacheControl": "3600",
                                     "x-upsert": "true",
-                                    "content-type": "application/pdf",
+                                    "content-type": mime_type,
                                 },
                             )
 
@@ -590,7 +767,7 @@ async def main():
             # Metadaten aus Supabase holen
             try:
                 res = (
-                    client.table("rag_pages")
+                    supabase_client.client.table("rag_pages")
                     .select("content", "metadata")
                     .eq("url", delete_filename)
                     .limit(1)
@@ -634,16 +811,14 @@ async def main():
 
             if st.button("Ausgewählte Dokument/Notiz löschen"):
                 st.write("Dateiname zur Löschung:", delete_filename)
-                result_log = delete_file_and_records(delete_filename)
-                st.code(result_log)
-                await update_available_sources()
 
                 storage_deleted = db_deleted = False
 
                 try:
-                    st.write("Dateiname zur Löschung:", delete_filename)
                     print("Lösche:", delete_filename)
-                    client.storage.from_("privatedocs").remove([delete_filename])
+                    supabase_client.client.storage.from_("privatedocs").remove(
+                        [delete_filename]
+                    )
                     storage_deleted = True
                 except Exception as e:
                     st.error(f"Löschen aus dem Speicher fehlgeschlagen: {e}")
