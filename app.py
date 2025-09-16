@@ -385,15 +385,18 @@ async def main():
                                         original_filename = meta.get("original_filename", fn)
                                         storage_filename = meta.get("storage_filename", original_filename)
                                         
-                                        # Prüfe, ob es eine alte Notiz ist (ohne .txt Extension)
-                                        if not original_filename.endswith('.txt') and meta.get("source_filter") == "notes":
-                                            # Alte Notiz - keine Storage-Datei verfügbar
+                                        # Prüfe, ob Storage-Datei verfügbar ist
+                                        has_storage = meta.get("has_storage_file", True)  # Default True für Rückwärtskompatibilität
+                                        source_filter = meta.get("source_filter", "privatedocs")
+                                        
+                                        if has_storage and source_filter == "privatedocs":
+                                            # Notiz mit Storage-Datei
+                                            note_filename = storage_filename or original_filename
+                                            bucket = "privatedocs"
+                                        else:
+                                            # Notiz ohne Storage-Datei (alte Notizen oder Upload-Fehler)
                                             note_filename = None
                                             bucket = "notes"
-                                        else:
-                                            # Neue Notiz - verwende Storage-Dateinamen
-                                            note_filename = storage_filename or original_filename
-                                            bucket = meta.get("source_filter", "privatedocs")
                                         break
                             
                             # Erstelle signed URL für die Notiz
@@ -401,8 +404,24 @@ async def main():
                                 # Neue Notiz mit Storage-Datei
                                 try:
                                     client = get_supabase_client()
-                                    res = client.storage.from_(bucket).create_signed_url(note_filename, 3600)
+                                    # Erstelle signed URL mit UTF-8 Content-Type für korrekte Umlaute-Darstellung
+                                    res = client.storage.from_(bucket).create_signed_url(
+                                        note_filename, 
+                                        3600,
+                                        {
+                                            "download": False,
+                                            "transform": {
+                                                "format": "auto"
+                                            }
+                                        }
+                                    )
                                     signed_url = res.get("signedURL", "#")
+                                    
+                                    # Füge Content-Type Parameter zur URL hinzu für korrekte Encoding-Behandlung
+                                    if signed_url and signed_url != "#":
+                                        # Prüfe ob URL bereits Parameter hat
+                                        separator = "&" if "?" in signed_url else "?"
+                                        signed_url += f"{separator}response-content-type=text/plain;charset=utf-8"
                                     
                                     if signed_url and signed_url != "#":
                                         print(f"✅ Signed URL für Notiz erstellt: {signed_url[:50]}...")
@@ -507,14 +526,14 @@ async def main():
         manual_text = st.text_area("✍️ Dein Wissen", key="manual_text_input")
 
         # Handle manuelle Quelle sicher
-        source_options = ["Beratung", "Meeting", "Feedback", "Sonstiges"]
+        source_options = ["Wissen", "Beratung", "Meeting", "Feedback", "Sonstiges"]
         try:
             source_index = source_options.index(st.session_state.manual_source)
         except ValueError:
             source_index = 0
 
         source_type = st.selectbox(
-            "Quelle des Wissens",
+            "Kategorie",
             source_options,
             index=source_index,
             key="manual_source_input",
@@ -547,15 +566,38 @@ async def main():
                             timestamp = now_berlin.strftime("%Y-%m-%d %H:%M")
                             full_title = f"{manual_title.strip()} ({timestamp})"
                             
-                            # Erstelle eine Textdatei für die Notiz
-                            note_filename = f"{manual_title.strip()}_{now_berlin.strftime('%Y%m%d_%H%M')}.txt"
+                            # Erstelle eine Textdatei für die Notiz (bereinige Dateinamen für Supabase)
+                            import re
+                            import unicodedata
+                            
+                            # Schritt 1: Normalisiere Unicode und entferne Akzente/Umlaute
+                            normalized = unicodedata.normalize('NFD', manual_title.strip())
+                            ascii_title = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+                            
+                            # Schritt 2: Erlaube nur Supabase-konforme Zeichen: a-zA-Z0-9_.-
+                            safe_title = re.sub(r'[^a-zA-Z0-9\s\-_.]', '', ascii_title)
+                            
+                            # Schritt 3: Ersetze Leerzeichen durch Unterstriche
+                            safe_title = re.sub(r'\s+', '_', safe_title)
+                            
+                            # Schritt 4: Entferne mehrfache Unterstriche
+                            safe_title = re.sub(r'_+', '_', safe_title)
+                            
+                            # Schritt 5: Entferne führende/trailing Unterstriche
+                            safe_title = safe_title.strip('_')
+                            
+                            note_filename = f"{safe_title}_{now_berlin.strftime('%Y%m%d_%H%M')}.txt"
                             note_content = f"Titel: {manual_title.strip()}\nQuelle: {source_type}\nErstellt: {timestamp}\n\n{manual_text}"
                             
                             # Speichere Notiz im Storage
+                            storage_success = False
                             try:
+                                # UTF-8 mit BOM für bessere Browser-Kompatibilität bei deutschen Umlauten
+                                note_content_bytes = '\ufeff'.encode('utf-8') + note_content.encode('utf-8')
+                                
                                 supabase_client.client.storage.from_("privatedocs").upload(
                                     note_filename,
-                                    note_content.encode('utf-8'),
+                                    note_content_bytes,
                                     {
                                         "cacheControl": "3600",
                                         "x-upsert": "true",
@@ -563,19 +605,34 @@ async def main():
                                     },
                                 )
                                 print(f"✅ Notiz im Storage gespeichert: {note_filename}")
+                                storage_success = True
                             except Exception as storage_error:
                                 print(f"⚠️ Storage-Upload fehlgeschlagen: {storage_error}")
+                                print(f"   Verwende Fallback ohne Storage-Link")
                                 # Fahre trotzdem fort - Notiz wird zumindest in der DB gespeichert
                             
-                            metadata = {
-                                "source": "manuell",
-                                "quelle": source_type,
-                                "title": manual_title.strip(),
-                                "upload_time": now_berlin.isoformat(),
-                                "original_filename": note_filename,  # Verwende den Storage-Dateinamen
-                                "source_filter": "privatedocs",  # Gleicher Bucket wie PDFs
-                                "storage_filename": note_filename,  # Zusätzlich für Klarheit
-                            }
+                            # Metadaten abhängig vom Storage-Erfolg setzen
+                            if storage_success:
+                                metadata = {
+                                    "source": "manuell",
+                                    "quelle": source_type,
+                                    "title": manual_title.strip(),
+                                    "upload_time": now_berlin.isoformat(),
+                                    "original_filename": note_filename,  # Bereinigter Storage-Dateiname
+                                    "source_filter": "privatedocs",  # Storage verfügbar
+                                    "storage_filename": note_filename,
+                                    "has_storage_file": True,
+                                }
+                            else:
+                                metadata = {
+                                    "source": "manuell", 
+                                    "quelle": source_type,
+                                    "title": manual_title.strip(),
+                                    "upload_time": now_berlin.isoformat(),
+                                    "original_filename": manual_title.strip(),  # Fallback: Nur Titel
+                                    "source_filter": "notes",  # Kein Storage verfügbar
+                                    "has_storage_file": False,
+                                }
                             result = pipeline.process_text(
                                 content=manual_text,
                                 metadata=metadata,
