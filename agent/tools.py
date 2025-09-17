@@ -87,7 +87,7 @@ class KnowledgeBaseSearch:
             List of search results
         """
         print("\n---[RAG Retrieval]---")
-        print("Frage:", params.query)
+        print(f"🔍 [LLM REFORMULIERT] Such-Query: {params.query}")
 
         # Generate embedding for the query
         query_embedding = self.embedding_generator.embed_text(params.query)
@@ -172,11 +172,22 @@ class KnowledgeBaseSearch:
                 )
             )
 
-        # Optional: speichere Treffer im Agenten für UI-Anzeige
+        # Optional: speichere Treffer im Agenten für UI-Anzeige (akkumulierend)
         if self.owner_agent is not None:
-            self.owner_agent.last_match = (
-                results  # <- das sind die rohen Supabase-Treffer, nicht die gewrappten
-            )
+            if not hasattr(self.owner_agent, 'last_match') or self.owner_agent.last_match is None:
+                self.owner_agent.last_match = []
+                print("🔄 Initialisiere leeren last_match Akkumulator")
+            
+            # Akkumuliere alle Tool-Call Ergebnisse statt zu überschreiben
+            previous_count = len(self.owner_agent.last_match)
+            self.owner_agent.last_match.extend(results)
+            print(f"🔄 Akkumulierte Treffer: {len(results)} neue + {previous_count} vorherige = {len(self.owner_agent.last_match)} gesamt")
+            
+            # Debug: Zeige was akkumuliert wurde
+            for i, result in enumerate(results):
+                url = result.get('url', 'Unknown')
+                sim = result.get('similarity', 0.0)
+                print(f"  └─ [{i+1}] {url} (Score: {sim:.3f})")
 
         return search_results
 

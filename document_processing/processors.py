@@ -12,6 +12,7 @@ import PyPDF2
 from unstructured.partition.pdf import partition_pdf
 import unicodedata
 from pathlib import Path
+from document_processing.chunker import TextChunker
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -60,15 +61,27 @@ class TxtProcessor(DocumentProcessor):
     Processor for plain text files with robust error handling.
     """
 
-    def extract_text(self, file_path: str) -> str:
+    def __init__(self, chunker: Optional[TextChunker] = None):
+        """Initialize TxtProcessor with optional chunker instance."""
+        if chunker:
+            self.chunker = chunker
+            logger.info(f"TxtProcessor using provided chunker with size={chunker.chunk_size}, overlap={chunker.chunk_overlap}")
+        else:
+            # Fallback: create own chunker with environment variables or defaults
+            chunk_size = int(os.getenv('CHUNK_SIZE', 2000))
+            chunk_overlap = int(os.getenv('CHUNK_OVERLAP', 400))
+            self.chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            logger.info(f"TxtProcessor created own chunker with size={chunk_size}, overlap={chunk_overlap}")
+
+    def extract_text(self, file_path: str) -> List[Dict[str, Any]]:
         """
-        Extract text from a TXT file with encoding fallbacks.
+        Extract text from a TXT file, chunk it, and return list of chunk dictionaries.
 
         Args:
             file_path: Path to the TXT file
 
         Returns:
-            Extracted text content
+            List of chunk dictionaries with structure {"text": ..., "page": ...}
         """
         path = Path(file_path)
 
@@ -99,7 +112,11 @@ class TxtProcessor(DocumentProcessor):
                 f"Could not decode file with any of the attempted encodings"
             )
 
-        return content
+        # Chunk the text using TextChunker
+        chunks = self.chunker.chunk_text(content)
+        
+        logger.info(f"Extracted and chunked text into {len(chunks)} chunks from {path.name}")
+        return chunks
 
     def get_metadata(self, file_path: str) -> Dict[str, Any]:
         """
@@ -115,11 +132,13 @@ class TxtProcessor(DocumentProcessor):
         metadata["content_type"] = "text/plain"
         metadata["processor"] = "TxtProcessor"
 
-        # Count lines and words
+        # Count lines and words from chunks
         try:
-            text = self.extract_text(file_path)
-            metadata["line_count"] = len(text.splitlines())
-            metadata["word_count"] = len(text.split())
+            chunks = self.extract_text(file_path)
+            full_text = " ".join([chunk["text"] for chunk in chunks])
+            metadata["line_count"] = len(full_text.splitlines())
+            metadata["word_count"] = len(full_text.split())
+            metadata["chunk_count"] = len(chunks)
         except Exception:
             # Don't fail metadata collection if text extraction fails
             pass
@@ -175,12 +194,13 @@ class PdfProcessor(DocumentProcessor):
         return metadata
 
 
-def get_document_processor(file_path: str) -> Optional[DocumentProcessor]:
+def get_document_processor(file_path: str, chunker: Optional[TextChunker] = None) -> Optional[DocumentProcessor]:
     """
     Get the appropriate processor for a file based on its extension.
 
     Args:
         file_path: Path to the document file
+        chunker: Optional TextChunker instance to use for TXT files
 
     Returns:
         DocumentProcessor instance for the file type or None if unsupported
@@ -188,13 +208,13 @@ def get_document_processor(file_path: str) -> Optional[DocumentProcessor]:
     path = Path(file_path)
     extension = path.suffix.lower()
 
-    processors = {
-        ".txt": TxtProcessor(),
-        ".pdf": PdfProcessor(),
-        # Add more processors here as needed
-    }
-
-    processor = processors.get(extension)
+    # Create processor instances
+    if extension == ".txt":
+        processor = TxtProcessor(chunker=chunker)
+    elif extension == ".pdf":
+        processor = PdfProcessor()
+    else:
+        processor = None
 
     if processor:
         logger.info(f"Using {processor.__class__.__name__} for {path.name}")

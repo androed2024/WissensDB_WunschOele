@@ -59,7 +59,7 @@ class DocumentIngestionPipeline:
             return []
         print("JETZT DOC PROCESSING......", file_path)
         try:
-            processor = get_document_processor(file_path)
+            processor = get_document_processor(file_path, chunker=self.chunker)
             if not processor:
                 logger.error(f"Unsupported file type: {file_path}")
                 return []
@@ -106,6 +106,7 @@ class DocumentIngestionPipeline:
                     "original_filename": metadata.get("original_filename"),  # ✅ NEW
                     "signed_url": metadata.get("signed_url"),  # ✅ NEW
                     "file_path": file_path,
+                    "file_extension": os.path.splitext(file_path)[1].lower(),  # ✅ NEW
                     "file_size_bytes": os.path.getsize(file_path),
                     "processed_at": timestamp,
                     "chunk_count": len(chunks),

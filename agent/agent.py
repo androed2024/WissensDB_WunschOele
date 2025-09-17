@@ -118,7 +118,29 @@ def format_source_reference(metadata: Dict[str, Any], short: bool = False) -> st
 
     client = get_supabase_client()
     try:
-        res = client.storage.from_(bucket).create_signed_url(filename, 3600)
+        # Versuche verschiedene Ansätze für TXT-Dateien
+        file_extension = filename.lower().split('.')[-1] if '.' in filename else ''
+        
+        if file_extension == 'txt':
+            # Für TXT-Dateien versuche mit transform-Optionen
+            try:
+                res = client.storage.from_(bucket).create_signed_url(
+                    filename, 
+                    3600, 
+                    {
+                        "download": True,
+                        "transform": {
+                            "format": "text",
+                            "quality": 100
+                        }
+                    }
+                )
+            except Exception:
+                # Fallback: Standard signed URL
+                res = client.storage.from_(bucket).create_signed_url(filename, 3600)
+        else:
+            res = client.storage.from_(bucket).create_signed_url(filename, 3600)
+            
         signed = res.get("signedURL")
         if not signed:
             logging.error(f"Keine signed URL in Response: {res}")
@@ -130,10 +152,18 @@ def format_source_reference(metadata: Dict[str, Any], short: bool = False) -> st
     if bucket == "notes":
         return f"**Quelle:** Notiz: {filename}\n\n[Notiz anzeigen]({signed})"
 
-    if page:
-        signed += f"#page={page}"
-    page_info = f"Seite {page}" if page else "ohne Seitenangabe"
-    return f"**Quelle:** {filename}, {page_info}\n\n[PDF öffnen]({signed})"
+    # Bestimme Dateityp basierend auf Dateiendung
+    file_extension = filename.lower().split('.')[-1] if '.' in filename else ''
+    
+    if file_extension == 'txt':
+        # Für TXT-Dateien keine Seitenangabe und anderer Link-Text
+        return f"**Quelle:** {filename}\n\n[Textdatei öffnen]({signed})"
+    else:
+        # Für PDF-Dateien mit Seitenangabe
+        if page:
+            signed += f"#page={page}"
+        page_info = f"Seite {page}" if page else "ohne Seitenangabe"
+        return f"**Quelle:** {filename}, {page_info}\n\n[PDF öffnen]({signed})"
 
 
 # Singleton-Instanz für einfachen Import

@@ -185,6 +185,34 @@ class SupabaseClient:
             print(f"❌ Fehler beim Löschen von {filename} in rag_pages: {e}")
             return 0
 
+    def save_chat_history(self, user_name: str, question: str, answer: str) -> Dict[str, Any]:
+        """
+        Speichert eine Frage-Antwort-Interaktion in der chat_history Tabelle.
+        
+        Args:
+            user_name: Name des Benutzers (aktuell "admin")
+            question: Die Frage des Benutzers
+            answer: Die Antwort des KI Chatbots
+            
+        Returns:
+            Dict mit den gespeicherten Daten oder leer bei Fehler
+        """
+        try:
+            # MEZ Zeitzone für created_at wird automatisch von Supabase gesetzt
+            data = {
+                "user_name": user_name,
+                "question": question,
+                "answer": answer
+            }
+            
+            result = self.client.table("chat_history").insert(data).execute()
+            print(f"✅ Chat-Historie gespeichert: Benutzer={user_name}, Frage={question[:50]}...")
+            return result.data[0] if result.data else {}
+            
+        except Exception as e:
+            print(f"❌ Fehler beim Speichern der Chat-Historie: {e}")
+            return {}
+
 
 def setup_database_tables() -> None:
     """
