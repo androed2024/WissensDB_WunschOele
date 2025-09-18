@@ -333,44 +333,143 @@ async def main():
     if "processed_files" not in st.session_state:
         st.session_state.processed_files = set()
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        [
-            "💬 Wunsch-Öle KI Assistent",
-            "➕ Wissen hinzufügen",
-            "📄 Dokumente hochladen",
-            "🗑️ Dokument anzeigen / löschen",
-        ]
-    )
-
-    with tab1:
-        # Vereinfachtes Layout ohne feste Header
-        st.markdown("""
-        <style>
-        /* Basis-Styling ohne feste Positionierung */
-        .stChatInput textarea {
-            min-height: 60px !important;
-            border-radius: 8px !important;
-            border: 2px solid #dee2e6 !important;
-            padding: 12px 16px !important;
-        }
+    # Hierarchisches Menü-System
+    st.markdown("""
+    <style>
+    .menu-header {
+        font-size: 20px !important;
+        font-weight: 600 !important;
+        margin-bottom: 10px !important;
+        color: #1f1f1f !important;
+    }
+    .menu-button {
+        font-size: 18px !important;
+        padding: 8px 16px !important;
+        margin: 4px 0 !important;
+        border-radius: 8px !important;
+        border: 1px solid #dee2e6 !important;
+        background: white !important;
+        cursor: pointer !important;
+    }
+    .menu-button:hover {
+        background: #f8f9fa !important;
+        border-color: #007BFF !important;
+    }
+    .submenu-button {
+        font-size: 16px !important;
+        padding: 6px 12px !important;
+        margin: 2px 0 !important;
+        margin-left: 20px !important;
+        border-radius: 6px !important;
+        border: 1px solid #e9ecef !important;
+        background: #f8f9fa !important;
+        cursor: pointer !important;
+    }
+    .submenu-button:hover {
+        background: #e9ecef !important;
+        border-color: #007BFF !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Session state für Menü-Navigation
+    if "current_menu" not in st.session_state:
+        st.session_state.current_menu = "chat"
+    if "current_submenu" not in st.session_state:
+        st.session_state.current_submenu = "chat"
+    
+    # Top-Level Menü
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("💬 Wunsch-Öle KI Assistent", key="menu_chat", use_container_width=True):
+            st.session_state.current_menu = "chat_assistant"
+            st.session_state.current_submenu = "chat"
+    
+    with col2:
+        if st.button("➕ Wissen hinzufügen", key="menu_knowledge", use_container_width=True):
+            st.session_state.current_menu = "add_knowledge" 
+            st.session_state.current_submenu = "note"
+    
+    with col3:
+        if st.button("🗑️ Dokument anzeigen / löschen", key="menu_delete", use_container_width=True):
+            st.session_state.current_menu = "manage_docs"
+    
+    st.markdown("<hr style='margin-top: 10px; margin-bottom: 15px;'>", unsafe_allow_html=True)
+    
+    # Level-2 Menüs basierend auf Auswahl
+    if st.session_state.current_menu == "chat_assistant":
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Chat", key="submenu_chat", use_container_width=True):
+                st.session_state.current_submenu = "chat"
+        with col2:
+            if st.button("Chat Historie", key="submenu_history", use_container_width=True):
+                st.session_state.current_submenu = "history"
         
-        .stChatInput textarea:focus {
-            border-color: #007BFF !important;
-            box-shadow: 0 0 0 3px rgba(0,123,255,0.1) !important;
-        }
+        st.markdown("<hr style='margin-top: 10px; margin-bottom: 15px;'>", unsafe_allow_html=True)
+    
+    elif st.session_state.current_menu == "add_knowledge":
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Notiz hinzufügen", key="submenu_note", use_container_width=True):
+                st.session_state.current_submenu = "note"
+        with col2:
+            if st.button("Dokumente hochladen", key="submenu_upload", use_container_width=True):
+                st.session_state.current_submenu = "upload"
         
-        .chat-section {
-            margin-top: 1rem;
-        }
-        </style>
-        
-        """, unsafe_allow_html=True)
+        st.markdown("<hr style='margin-top: 10px; margin-bottom: 15px;'>", unsafe_allow_html=True)
 
-        # Header mit gleicher Schriftgröße wie andere Menüs
-        st.markdown("<h4>💬 Spreche mit dem Wunsch-Öle KI Assistenten</h4>", unsafe_allow_html=True)
+    # Content-Bereich basierend auf aktueller Menü-/Submenu-Auswahl
+    if st.session_state.current_menu == "chat_assistant":
+        if st.session_state.current_submenu == "chat":
+            # Chat-Interface
+            render_chat_interface()
+        elif st.session_state.current_submenu == "history":
+            # Chat-Historie Interface
+            render_chat_history()
+    
+    elif st.session_state.current_menu == "add_knowledge":
+        if st.session_state.current_submenu == "note":
+            # Notiz hinzufügen Interface
+            render_add_note_interface()
+        elif st.session_state.current_submenu == "upload":
+            # Dokumente hochladen Interface
+            render_upload_interface()
+    
+    elif st.session_state.current_menu == "manage_docs":
+        # Dokument anzeigen/löschen Interface
+        render_manage_docs_interface()
 
-        # Input-Feld ohne Box
-        user_input = st.chat_input("Stelle eine Frage zu den Dokumenten...")
+
+def render_chat_interface():
+    """Rendert das Chat-Interface"""
+    st.markdown("""
+    <style>
+    /* Basis-Styling ohne feste Positionierung */
+    .stChatInput textarea {
+        min-height: 60px !important;
+        border-radius: 8px !important;
+        border: 2px solid #dee2e6 !important;
+        padding: 12px 16px !important;
+    }
+    
+    .stChatInput textarea:focus {
+        border-color: #007BFF !important;
+        box-shadow: 0 0 0 3px rgba(0,123,255,0.1) !important;
+    }
+    
+    .chat-section {
+        margin-top: 1rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Header mit gleicher Schriftgröße wie andere Menüs
+    st.markdown("<h4>💬 Spreche mit dem Wunsch-Öle KI Assistenten</h4>", unsafe_allow_html=True)
+
+    # Input-Feld ohne Box
+    user_input = st.chat_input("Stelle eine Frage zu den Dokumenten...")
 
         # Chat-Input Verarbeitung ZUERST
         if user_input:
@@ -688,10 +787,6 @@ async def main():
         for key in ["manual_title", "manual_text", "manual_source"]:
             if key not in st.session_state:
                 st.session_state[key] = ""
-        
-        # Initialisierung für Erfolgs-/Fehlermeldungen
-        if "note_save_message" not in st.session_state:
-            st.session_state.note_save_message = ""
 
         # Eingabefelder mit session_state
         manual_title = st.text_input(
@@ -718,9 +813,6 @@ async def main():
         col1, col2 = st.columns([3, 2])
         with col1:
             if st.button("✅ Wissen / Notiz speichern", key="save_button"):
-                # Clear any previous messages
-                st.session_state.note_save_message = ""
-                
                 if not manual_title.strip() or not manual_text.strip():
                     st.warning(
                         "⚠️ Bitte gib sowohl eine Überschrift als auch einen Text ein."
@@ -815,33 +907,25 @@ async def main():
                                 metadata=metadata,
                                 url=manual_title.strip(),
                             )
-                            # Set success message instead of toast
-                            st.session_state.note_save_message = "✅ Wissen/Notizen erfolgreich gespeichert"
+                            st.toast(
+                                "🧠 Wissen/Notizen erfolgreich gespeichert", icon="✅"
+                            )
                             await update_available_sources()
                             st.session_state.manual_title = ""
                             st.session_state.manual_text = ""
                             st.session_state.manual_source = "Beratung"
                             st.rerun()
                         except Exception as e:
-                            # Set error message instead of direct error display
-                            st.session_state.note_save_message = f"❌ Fehler beim Speichern des Wissens/der Notiz: {e}"
+                            st.error(
+                                f"❌ Fehler beim Speichern des Wissens/der Notiz: {e}"
+                            )
 
         with col2:
             if st.button("🧹 Eingaben leeren", key="clear_button"):
                 st.session_state.manual_title = ""
                 st.session_state.manual_text = ""
                 st.session_state.manual_source = "Beratung"
-                st.session_state.note_save_message = ""  # Clear success message
                 st.rerun()
-        
-        # Display success/error message below buttons
-        if st.session_state.note_save_message:
-            if st.session_state.note_save_message.startswith("✅"):
-                st.success(st.session_state.note_save_message)
-            elif st.session_state.note_save_message.startswith("❌"):
-                st.error(st.session_state.note_save_message)
-            else:
-                st.info(st.session_state.note_save_message)
 
     with tab3:
         st.markdown(
@@ -908,6 +992,8 @@ async def main():
             if new_files and not st.session_state.get("currently_uploading", False):
                 # Set upload in progress flag
                 st.session_state.currently_uploading = True
+                
+                st.subheader("⏳ Upload-Status")
                 
                 # Clear old upload status table for new upload
                 st.session_state.upload_status_table = []
@@ -1265,6 +1351,21 @@ async def main():
                 # Clear the live update table to avoid duplicates
                 table_placeholder.empty()
                 
+                # Final message
+                successful_uploads = sum(1 for row in table_data if row['Status'] == '✅ Hochgeladen')
+                already_uploaded = sum(1 for row in table_data if row['Status'] == '✅ Bereits hochgeladen')
+                total_new_files = len(new_files)
+                total_files = len(table_data)
+                
+                if total_new_files == 0 and already_uploaded > 0:
+                    st.info(f"ℹ️ Alle {already_uploaded} ausgewählte(n) Datei(en) wurden bereits in dieser Session hochgeladen.")
+                elif successful_uploads == total_new_files and total_new_files > 0:
+                    st.success(f"🎉 Alle {total_new_files} neue(n) Datei(en) erfolgreich hochgeladen!")
+                elif successful_uploads > 0:
+                    st.warning(f"⚠️ {successful_uploads} von {total_new_files} neue(n) Datei(en) erfolgreich hochgeladen.")
+                elif total_new_files > 0:
+                    st.error(f"❌ Keine der {total_new_files} neue(n) Datei(en) konnten hochgeladen werden.")
+
                 # Reset upload flags
                 st.session_state.just_uploaded = True
                 st.session_state.currently_uploading = False
@@ -1273,8 +1374,8 @@ async def main():
                 await update_available_sources()
                 print(f"🔄 Nach Upload: {st.session_state.get('document_count', 0)} Dokumente, {st.session_state.get('knowledge_count', 0)} Notizen")
                 
-                # Count successful uploads for rerun logic only
-                successful_uploads = sum(1 for row in table_data if row['Status'] == '✅ Hochgeladen')
+                # Show success message
+                st.success(f"✅ Upload abgeschlossen! {successful_uploads} Datei(en) erfolgreich verarbeitet.")
                 
                 # Update header by triggering rerun only if files were successfully uploaded
                 if successful_uploads > 0:
