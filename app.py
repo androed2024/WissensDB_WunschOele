@@ -28,6 +28,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.agent import format_source_reference
 
 import asyncio
+import time
 from typing import List, Dict, Any
 from pathlib import Path
 import tempfile
@@ -74,6 +75,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import mimetypes
+
+# Import progress tracking modules
+from progress_tracker import ProgressTracker
+from helpers_progress import count_text_chars, estimate_total_chunks
+
+# Environment variables with defaults
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "5"))
+DB_BATCH_SIZE = int(os.getenv("DB_BATCH_SIZE", "100"))
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -149,18 +160,47 @@ def display_message_part(part):
             st.markdown(part.content)
 
 
+from typing import Callable, Optional
+
+# Type alias for phase callback
+PhaseCB = Callable[[str, int, int], None]
+
 async def process_document(
-    file_path: str, original_filename: str, metadata: Dict[str, Any]
+    file_path: str, 
+    safe_filename: str, 
+    metadata: Dict[str, Any],
+    on_phase: Optional[PhaseCB] = None
 ) -> Dict[str, Any]:
+    """
+    Asynchrone Dokumentenverarbeitung mit Phasen-Callbacks.
+    
+    Args:
+        file_path: Pfad zur zu verarbeitenden Datei
+        safe_filename: Sicherer Dateiname für die Speicherung
+        metadata: Metadaten für das Dokument
+        on_phase: Optional callback für Phasen-Updates (phase, processed, total)
+        
+    Returns:
+        Dict mit success, chunk_count und ggf. error
+    """
     pipeline = DocumentIngestionPipeline()
     loop = asyncio.get_event_loop()
 
     try:
+        # P4: Finalisierung wird am Ende aufgerufen
+        def wrapped_on_phase(phase: str, processed: int, total: int):
+            if on_phase:
+                try:
+                    on_phase(phase, processed, total)
+                except Exception as e:
+                    print(f"⚠️ Fehler bei Progress-Update ({phase}): {e}")
+                    # Continue processing even if UI update fails
         
         chunks = await loop.run_in_executor(
             None,
-            lambda: pipeline.process_file(file_path, metadata),
+            lambda: pipeline.process_file(file_path, metadata, on_phase=wrapped_on_phase),
         )
+        
         if not chunks:
             return {
                 "success": False,
@@ -168,6 +208,10 @@ async def process_document(
                 "error": "Keine gültigen Textabschnitte gefunden",
             }
 
+        # P4: Finalisierung - Sign URLs, Checks, Cache Warmup
+        if on_phase:
+            on_phase("finalize", 0, 1)
+            
         print("\n📦 Embedding-Check")
         for i, c in enumerate(chunks):
             emb = c.get("embedding")
@@ -175,6 +219,10 @@ async def process_document(
             print(
                 f"Chunk {i+1}: Embedding: {len(emb) if emb else 0} Werte | Text: {text[:100].replace(chr(10), ' ')}..."
             )
+        
+        # Finalisierung abgeschlossen
+        if on_phase:
+            on_phase("finalize", 1, 1)
 
         return {"success": True, "file_path": file_path, "chunk_count": len(chunks)}
     except Exception as e:
@@ -822,6 +870,8 @@ async def main():
                     del st.session_state.upload_status_table
                 if "just_uploaded" in st.session_state:
                     st.session_state.just_uploaded = False
+                if "upload_just_completed" in st.session_state:
+                    st.session_state.upload_just_completed = False
                 # Clear all old selection keys to prevent conflicts
                 keys_to_remove = [key for key in st.session_state.keys() if key.startswith("selection_")]
                 for key in keys_to_remove:
@@ -1062,29 +1112,128 @@ async def main():
                             update_table_row(uploaded_file.name, f'Storage-Fehler: {storage_error_msg}', '❌ Error')
                             continue
                             
-                        update_table_row(uploaded_file.name, '30%', '📤 Dateiübertragung abgeschlossen')
+                        # Initialize ProgressTracker after upload completion
+                        tracker = ProgressTracker(
+                            filename=uploaded_file.name,
+                            update_ui=lambda fn, pct, status: update_table_row(fn, pct, status),
+                            file_size_bytes=uploaded_file.size
+                        )
+                        
+                        # Mark upload phase as completed
+                        tracker.set_total("upload", 1)
+                        tracker.tick("upload", 1, status="📤 Dateiübertragung abgeschlossen")
+
+                        # Pre-estimation for logging (optional)
+                        try:
+                            total_chars = count_text_chars(temp_file_path, mime_type)
+                            est_chunks = estimate_total_chunks(total_chars, CHUNK_SIZE, CHUNK_OVERLAP)
+                            print(f"📊 Geschätzte Chunks für {uploaded_file.name}: {est_chunks} (basierend auf {total_chars} Zeichen)")
+                        except Exception as e:
+                            print(f"⚠️ Fehler bei Chunk-Schätzung für {uploaded_file.name}: {e}")
+                            est_chunks = None
 
                         metadata = {
                             "source": "ui_upload",
                             "upload_time": str(datetime.now()),
                             "original_filename": safe_filename,
                             "file_hash": file_hash,
-                            "source_filter": "privatedocs",  # This might be missing
+                            "source_filter": "privatedocs",
                         }
 
-                        update_table_row(uploaded_file.name, '50%', '🧠 Verarbeitung läuft...')
+                        # Store progress state (thread-safe) - UI updates happen in main thread
+                        progress_state = {
+                            "phase": "upload",
+                            "processed": 0,
+                            "total": 1,
+                            "last_update": 0
+                        }
+                        
+                        def on_phase(phase: str, processed: int, total: int):
+                            try:
+                                # Just store state - no UI updates from thread
+                                progress_state["phase"] = phase
+                                progress_state["processed"] = processed
+                                progress_state["total"] = total
+                                progress_state["last_update"] = time.time()
+                                print(f"📊 {phase}: {processed}/{total}")
+                            except Exception as e:
+                                print(f"⚠️ Progress-State Fehler ({phase}): {e}")
 
-                        result = await process_document(
-                            temp_file_path, safe_filename, metadata
-                        )
+                        # Start processing with real progress tracking
+                        update_table_row(uploaded_file.name, '35%', '🧠 Verarbeitung startet...')
 
-                        update_table_row(uploaded_file.name, '80%', '🔄 Finalisierung...')
+                        # Start background task for UI updates
+                        async def update_ui_from_state():
+                            last_phase = ""
+                            last_processed = 0
+                            
+                            while True:
+                                try:
+                                    phase = progress_state["phase"]
+                                    processed = progress_state["processed"]
+                                    total = progress_state["total"]
+                                    
+                                    # Only update if something changed
+                                    if phase != last_phase or processed != last_processed:
+                                        # Set totals when first encountered
+                                        if tracker.total[phase] == 1 and total > 1:
+                                            tracker.set_total(phase, total)
+                                        
+                                        # Update progress
+                                        tracker.done[phase] = processed
+                                        
+                                        # Calculate percentage
+                                        start, end = tracker.RANGES[phase]
+                                        frac = min(1.0, processed / max(1, total))
+                                        pct = int(start + frac * (end - start))
+                                        
+                                        # Cap at 99% except for finalize
+                                        if phase != "finalize":
+                                            pct = min(pct, 99)
+                                            
+                                        status = tracker._default_status(phase)
+                                        
+                                        # Format with KB info
+                                        if tracker.file_size_bytes > 0:
+                                            processed_kb = (pct / 100.0) * (tracker.file_size_bytes / 1024)
+                                            total_kb = tracker.file_size_bytes / 1024
+                                            progress_str = f"{pct}% ({processed_kb:.1f}KB von {total_kb:.1f}KB)"
+                                        else:
+                                            progress_str = f"{pct}%"
+                                        
+                                        update_table_row(uploaded_file.name, progress_str, status)
+                                        
+                                        last_phase = phase
+                                        last_processed = processed
+                                        
+                                    await asyncio.sleep(0.5)  # Check every 500ms
+                                    
+                                except Exception as e:
+                                    print(f"⚠️ UI-Update-Loop Fehler: {e}")
+                                    await asyncio.sleep(1)
 
+                        # Start UI update task
+                        ui_task = asyncio.create_task(update_ui_from_state())
+
+                        try:
+                            result = await process_document(
+                                temp_file_path, safe_filename, metadata,
+                                on_phase=on_phase
+                            )
+                        finally:
+                            # Cancel UI update task when processing is done
+                            ui_task.cancel()
+                            try:
+                                await ui_task
+                            except asyncio.CancelledError:
+                                pass
+
+                        # Final status update
                         if result["success"]:
                             update_table_row(uploaded_file.name, f'✅ {result["chunk_count"]} Textabschnitte', '✅ Hochgeladen')
                             st.session_state.processed_files.add(file_id)
                         else:
-                            update_table_row(uploaded_file.name, f'Verarbeitungsfehler: {result["error"]}', '❌ Error')
+                            update_table_row(uploaded_file.name, f'Fehler: {result.get("error","Unbekannt")}', '❌ Error')
 
                     except Exception as e:
                         update_table_row(uploaded_file.name, f'Unerwarteter Fehler: {str(e)}', '❌ Error')
@@ -1098,6 +1247,10 @@ async def main():
                 
                 # Store table in session state for persistence
                 st.session_state.upload_status_table = table_data
+                st.session_state.just_uploaded = True
+                
+                # Clear the live update table to avoid duplicates
+                table_placeholder.empty()
                 
                 # Final message
                 successful_uploads = sum(1 for row in table_data if row['Status'] == '✅ Hochgeladen')
@@ -1122,17 +1275,23 @@ async def main():
                 await update_available_sources()
                 print(f"🔄 Nach Upload: {st.session_state.get('document_count', 0)} Dokumente, {st.session_state.get('knowledge_count', 0)} Notizen")
                 
-                # Seite neu laden damit Header mit aktualisierten Zählern angezeigt wird
-                st.rerun()
+                # Show success message
+                st.success(f"✅ Upload abgeschlossen! {successful_uploads} Datei(en) erfolgreich verarbeitet.")
+                
+                # Update header by triggering rerun only if files were successfully uploaded
+                if successful_uploads > 0:
+                    # Set flag to prevent "already processed" message after rerun
+                    st.session_state.upload_just_completed = True
+                    st.rerun()
 
-            elif already_processed_files and not new_files:
+            elif already_processed_files and not new_files and not st.session_state.get("upload_just_completed", False):
                 st.info("Alle Dateien wurden bereits verarbeitet")
         
-        # Display persistent upload status table if it exists (but not during active upload)
-        elif ("upload_status_table" in st.session_state and 
-              st.session_state.upload_status_table and 
-              not st.session_state.get("currently_uploading", False)):
-            st.subheader("📊 Letzter Upload-Status")
+        # Always display persistent upload status table if it exists
+        if ("upload_status_table" in st.session_state and 
+            st.session_state.upload_status_table and
+            not st.session_state.get("currently_uploading", False)):
+            st.subheader("📊 Upload-Status")
             st.table(st.session_state.upload_status_table)
             
             if st.button("🧹 Upload-Historie löschen", key="clear_upload_history"):

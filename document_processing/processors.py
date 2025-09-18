@@ -148,49 +148,158 @@ class TxtProcessor(DocumentProcessor):
 
 class PdfProcessor(DocumentProcessor):
     """
-    Processor for PDF files using unstructured for better text extraction.
+    Processor for PDF files with intelligent detection between text-based and scanned PDFs.
+    Uses PyPDF2 for fast text extraction when possible, falls back to unstructured OCR for scanned PDFs.
     """
 
-    def extract_text(self, file_path: str) -> List[Dict[str, Any]]:
-        from unstructured.partition.pdf import partition_pdf
-        import unicodedata
-
-        elements = partition_pdf(
-            filename=file_path,
-            languages=["deu", "eng"],
-            extract_images_in_pdf=False,
-        )
-
-        if not elements:
-            logger.warning(f"[Unstructured] No elements extracted: {file_path}")
+    def _has_extractable_text(self, file_path: str, check_pages: int = 3) -> bool:
+        """
+        Check if PDF has extractable text by testing the first few pages with PyPDF2.
+        
+        Args:
+            file_path: Path to the PDF file
+            check_pages: Number of pages to check (default: 3)
+            
+        Returns:
+            True if PDF has extractable text (>50 characters found), False otherwise
+        """
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                # Check if PDF has pages
+                if len(pdf_reader.pages) == 0:
+                    return False
+                    
+                # Check first few pages for text content
+                total_text = ""
+                pages_to_check = min(check_pages, len(pdf_reader.pages))
+                
+                for i in range(pages_to_check):
+                    page = pdf_reader.pages[i]
+                    page_text = page.extract_text()
+                    total_text += page_text
+                    
+                # Consider PDF as text-based if we find more than 50 characters
+                has_text = len(total_text.strip()) > 50
+                logger.info(f"PDF text detection: {len(total_text.strip())} characters found in first {pages_to_check} pages")
+                return has_text
+                
+        except Exception as e:
+            logger.warning(f"Error checking PDF text content with PyPDF2: {str(e)}")
+            return False
+    
+    def _extract_with_pypdf2(self, file_path: str) -> List[str]:
+        """
+        Extract text from PDF using PyPDF2 for fast processing of text-based PDFs.
+        
+        Args:
+            file_path: Path to the PDF file
+            
+        Returns:
+            List of raw text elements (one per page)
+        """
+        try:
+            text_elements = []
+            
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                for page_num, page in enumerate(pdf_reader.pages, 1):
+                    page_text = page.extract_text()
+                    if page_text.strip():  # Only add non-empty pages
+                        text_elements.append(page_text.strip())
+                        
+            logger.info(f"[PyPDF2-fast] Extracted text from {len(text_elements)} pages")
+            return text_elements
+            
+        except Exception as e:
+            logger.error(f"Error extracting text with PyPDF2: {str(e)}")
             return []
-
-        chunks = []
-
-        for el in elements:
-            if not el.text:
-                continue
-
-            # ✅ Use attribute access for modern unstructured versions
-            page = getattr(el.metadata, "page_number", 1)
-
-            text = (
-                unicodedata.normalize("NFKC", el.text)
-                .replace("\u2011", "-")
-                .replace("\u00a0", " ")
+    
+    def _extract_with_unstructured(self, file_path: str) -> List[str]:
+        """
+        Extract text from PDF using unstructured with OCR for scanned PDFs.
+        
+        Args:
+            file_path: Path to the PDF file
+            
+        Returns:
+            List of raw text elements
+        """
+        try:
+            from unstructured.partition.pdf import partition_pdf
+            import unicodedata
+            
+            elements = partition_pdf(
+                filename=file_path,
+                languages=["deu", "eng"],
+                extract_images_in_pdf=True,  # Enable OCR for scanned PDFs
+                strategy="hi_res"  # High resolution strategy for better OCR
             )
 
-            chunks.append({"text": text, "page": page})
+            if not elements:
+                logger.warning(f"[Unstructured-OCR] No elements extracted: {file_path}")
+                return []
 
-        logger.info(
-            f"[Unstructured] Extracted {len(chunks)} chunks with pages from {file_path}"
-        )
-        return chunks
+            text_elements = []
+            for el in elements:
+                if el.text and el.text.strip():
+                    # Normalize text
+                    text = (
+                        unicodedata.normalize("NFKC", el.text)
+                        .replace("\u2011", "-")
+                        .replace("\u00a0", " ")
+                    )
+                    text_elements.append(text)
+
+            logger.info(f"[Unstructured-OCR] Extracted {len(text_elements)} text elements")
+            return text_elements
+            
+        except Exception as e:
+            logger.error(f"Error extracting text with unstructured: {str(e)}")
+            return []
+
+    def extract_text(self, file_path: str) -> List[str]:
+        """
+        Extract text from PDF using intelligent method selection.
+        Returns raw text elements for further processing by ingestion pipeline.
+        
+        Args:
+            file_path: Path to the PDF file
+            
+        Returns:
+            List of raw text elements (not chunked)
+        """
+        # Determine which extraction method to use
+        if self._has_extractable_text(file_path):
+            # Use fast PyPDF2 extraction for text-based PDFs
+            logger.info(f"Using PyPDF2-fast extraction for text-based PDF: {os.path.basename(file_path)}")
+            text_elements = self._extract_with_pypdf2(file_path)
+            extraction_method = "PyPDF2-fast"
+        else:
+            # Use unstructured with OCR for scanned PDFs
+            logger.info(f"Using unstructured-OCR extraction for scanned PDF: {os.path.basename(file_path)}")
+            text_elements = self._extract_with_unstructured(file_path)
+            extraction_method = "unstructured-OCR"
+        
+        if not text_elements:
+            logger.warning(f"No text extracted from PDF: {file_path}")
+            return []
+            
+        logger.info(f"[{extraction_method}] Successfully extracted {len(text_elements)} text elements from {os.path.basename(file_path)}")
+        return text_elements
 
     def get_metadata(self, file_path: str) -> Dict[str, Any]:
         metadata = super().get_metadata(file_path)
         metadata["content_type"] = "application/pdf"
-        metadata["processor"] = "PdfProcessor(unstructured)"
+        
+        # Determine which processor method was/would be used
+        if self._has_extractable_text(file_path):
+            metadata["processor"] = "PdfProcessor(PyPDF2-fast)"
+        else:
+            metadata["processor"] = "PdfProcessor(unstructured-OCR)"
+            
         return metadata
 
 

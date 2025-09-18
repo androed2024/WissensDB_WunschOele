@@ -89,8 +89,8 @@ class TextChunker:
 
         print(f"Created {len(chunks)} chunks from {text_length} characters of text")
 
-        chunk_dicts = [{"text": c, "page": i + 1} for i, c in enumerate(chunks)]
-        return chunk_dicts
+        # chunks is already a list of dictionaries from the loop above
+        return chunks
 
     def chunk_by_separator(self, text: str, separator: str = "\n\n") -> List[str]:
         """
@@ -125,7 +125,7 @@ class TextChunker:
         # Handle case where each part is already small enough
         if all(len(part) <= self.chunk_size for part in parts):
             print("All parts are within chunk size limit")
-            return parts
+            return [{"text": part, "page": i + 1} for i, part in enumerate(parts)]
 
         # Combine parts into chunks that fit within chunk_size
         chunks = []
@@ -163,5 +163,4 @@ class TextChunker:
             chunks.append(current_chunk)
 
         print(f"Created {len(chunks)} chunks using separator-based chunking")
-        chunk_dicts = [{"text": c, "page": i + 1} for i, c in enumerate(chunks)]
-        return chunk_dicts
+        return [{"text": c, "page": i + 1} for i, c in enumerate(chunks)]

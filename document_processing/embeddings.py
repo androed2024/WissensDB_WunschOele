@@ -80,13 +80,14 @@ class EmbeddingGenerator:
                     print("All retry attempts failed, returning zero embedding")
                     return self._create_zero_embedding()
 
-    def embed_batch(self, texts: List[str], batch_size: int = 5) -> List[List[float]]:
+    def embed_batch(self, texts: List[str], batch_size: int = 5, progress_callback=None) -> List[List[float]]:
         """
         Generate embeddings for multiple texts in small batches.
 
         Args:
             texts: List of texts to embed
             batch_size: Number of texts to process in each batch
+            progress_callback: Optional callback function (current_batch, total_batches)
 
         Returns:
             List of embedding vectors
@@ -99,13 +100,21 @@ class EmbeddingGenerator:
             return []
 
         results = []
+        total_batches = (len(valid_texts) - 1) // batch_size + 1
 
         # Process in small batches to avoid memory issues
         for i in range(0, len(valid_texts), batch_size):
             batch = valid_texts[i : i + batch_size]
-            print(
-                f"Processing batch {i//batch_size + 1}/{(len(valid_texts)-1)//batch_size + 1} with {len(batch)} texts"
-            )
+            current_batch = i // batch_size + 1
+            
+            print(f"Processing batch {current_batch}/{total_batches} with {len(batch)} texts")
+            
+            # Call progress callback if provided
+            if progress_callback:
+                try:
+                    progress_callback(current_batch, total_batches)
+                except Exception as e:
+                    print(f"⚠️ Progress callback error: {e}")
 
             # Process each text individually for better error isolation
             batch_results = []
