@@ -151,6 +151,13 @@ if "sources" not in st.session_state:
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = set()
 
+# Initialize chat history session state
+if "chat_history_search" not in st.session_state:
+    st.session_state.chat_history_search = ""
+
+if "selected_chat_id" not in st.session_state:
+    st.session_state.selected_chat_id = None
+
 
 def display_message_part(part):
     if part.part_kind == "user-prompt" and part.content:
@@ -263,6 +270,186 @@ async def run_agent_with_streaming(user_input: str):
                             yield event.delta.content_delta
 
     st.session_state.messages.extend(run.result.new_messages())
+
+
+def get_chat_history(search_term: str = "") -> List[Dict]:
+    """Holt Chat-Historie aus Supabase mit optionaler Wildcard-Suche"""
+    try:
+        query = supabase_client.client.table("chat_history").select("*")
+        
+        if search_term.strip():
+            # Wildcard-Suche auf Frage-Feld
+            search_pattern = f"%{search_term}%"
+            query = query.ilike("question", search_pattern)
+        
+        response = query.order("created_at", desc=True).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"Fehler beim Abrufen der Chat-Historie: {e}")
+        return []
+
+
+def render_chat_history():
+    """Rendert die Chat-Historie mit Suchfunktion"""
+    # Überschrift mit gleicher Schriftgröße wie im Chat-Tab
+    st.markdown("<h5>📜 Chat Historie</h5>", unsafe_allow_html=True)
+    
+    # Suchfeld mit Button auf gleicher Höhe
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        search_term = st.text_input(
+            "🔍 Suche in Fragen (Wildcard-Suche)", 
+            value=st.session_state.chat_history_search,
+            key="chat_history_search_input"
+        )
+    with col2:
+        # Leerraum für Label-Alignment + Button
+        st.write("")
+        if st.button("🔍 Suchen", key="search_chat_history", use_container_width=True):
+            st.session_state.chat_history_search = search_term
+            st.rerun()
+    
+    # Chat-Historie abrufen
+    chat_history = get_chat_history(st.session_state.chat_history_search)
+    
+    if not chat_history:
+        if st.session_state.chat_history_search:
+            st.info(f"Keine Chats gefunden für Suchbegriff: '{st.session_state.chat_history_search}'")
+        else:
+            st.info("Keine Chat-Historie verfügbar.")
+        return
+    
+    # Zwei-Spalten Layout
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.markdown("**Chat-Liste:**")
+        
+        # Erstelle Tabellendaten für kompakte Darstellung
+        table_data = []
+        chat_options = {}
+        
+        for chat in chat_history:
+            chat_id = chat.get("id")
+            question = chat.get("question", "")
+            created_at = chat.get("created_at", "")
+            user_name = chat.get("user_name", "Unbekannt")
+            
+            # Formatiere Datum
+            try:
+                dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                formatted_date = dt.strftime("%d.%m.%Y")
+                formatted_time = dt.strftime("%H:%M")
+            except:
+                formatted_date = created_at
+                formatted_time = ""
+            
+            # Kürze die Frage für die Tabelle
+            display_question = question[:50] + "..." if len(question) > 50 else question
+            
+            # Füge zur Tabelle hinzu
+            table_data.append({
+                "Datum": formatted_date,
+                "Zeit": formatted_time,
+                "Benutzer": user_name,
+                "Frage": display_question
+            })
+            
+            # Für Selectbox
+            chat_label = f"{formatted_date} {formatted_time} - {display_question}"
+            chat_options[chat_label] = chat_id
+        
+        # Zeige kompakte Tabelle
+        if table_data:
+            st.dataframe(
+                table_data,
+                use_container_width=True,
+                hide_index=True,
+                height=400,
+                column_config={
+                    "Datum": st.column_config.TextColumn("Datum", width="small"),
+                    "Zeit": st.column_config.TextColumn("Zeit", width="small"),
+                    "Benutzer": st.column_config.TextColumn("User", width="small"),
+                    "Frage": st.column_config.TextColumn("Frage", width="large")
+                }
+            )
+        
+        # Selectbox für Chat-Auswahl
+        st.markdown("---")
+        st.markdown("**Chat auswählen:**")
+        
+        if chat_options:
+            # Finde aktuell ausgewählten Index
+            current_index = 0
+            current_key = None
+            
+            if st.session_state.selected_chat_id:
+                for i, (label, chat_id) in enumerate(chat_options.items()):
+                    if chat_id == st.session_state.selected_chat_id:
+                        current_index = i
+                        current_key = label
+                        break
+            
+            # Selectbox mit "Bitte wählen" Option
+            options = ["Bitte Chat auswählen..."] + list(chat_options.keys())
+            default_index = current_index + 1 if current_key else 0
+            
+            selected_label = st.selectbox(
+                "Chat:",
+                options=options,
+                index=default_index,
+                key="chat_selector",
+                label_visibility="collapsed"
+            )
+            
+            # Update selected chat wenn sich Auswahl ändert
+            if selected_label and selected_label != "Bitte Chat auswählen...":
+                new_chat_id = chat_options[selected_label]
+                if new_chat_id != st.session_state.selected_chat_id:
+                    st.session_state.selected_chat_id = new_chat_id
+                    st.rerun()
+            elif selected_label == "Bitte Chat auswählen...":
+                if st.session_state.selected_chat_id is not None:
+                    st.session_state.selected_chat_id = None
+                    st.rerun()
+    
+    with col2:
+        st.markdown("**Chat-Details:**")
+        if st.session_state.selected_chat_id:
+            # Finde den ausgewählten Chat
+            selected_chat = next(
+                (chat for chat in chat_history if chat.get("id") == st.session_state.selected_chat_id),
+                None
+            )
+            
+            if selected_chat:
+                question = selected_chat.get("question", "")
+                answer = selected_chat.get("answer", "")
+                created_at = selected_chat.get("created_at", "")
+                user_name = selected_chat.get("user_name", "Unbekannt")
+                
+                # Formatiere Datum
+                try:
+                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    formatted_date = dt.strftime("%d.%m.%Y um %H:%M Uhr")
+                except:
+                    formatted_date = created_at
+                
+                # Header
+                st.markdown(f"**Datum:** {formatted_date}")
+                st.markdown(f"**Benutzer:** {user_name}")
+                st.markdown("---")
+                
+                # Frage und Antwort
+                with st.chat_message("user"):
+                    st.markdown(question)
+                
+                with st.chat_message("assistant"):
+                    st.markdown(answer)
+            else:
+                st.info("Chat nicht gefunden.")
+        else:
+            st.info("Wählen Sie einen Chat aus der Liste aus, um die Details zu sehen.")
 
 
 async def update_available_sources():
@@ -683,9 +870,8 @@ async def main():
             # Kein else-Block nötig - ohne Input wird einfach nichts angezeigt
         
         with chat_tab2:
-            # Chat Historie Platzhalter
-            st.markdown("<h5>📜 Chat Historie</h5>", unsafe_allow_html=True)
-            st.info("🚧 **Wird noch implementiert** - Diese Funktion wird in einer späteren Version verfügbar sein.")
+            # Chat Historie implementiert
+            render_chat_history()
 
     with tab2:
         # Erstelle Untermenü mit zwei Optionen (ohne doppelten Titel)
@@ -727,129 +913,125 @@ async def main():
                 key="manual_source_input",
             )
 
-        # Button-Reihe nebeneinander mit Columns
-        col1, col2, col3 = st.columns([2, 1.5, 3])
-        with col1:
-            if st.button("✅ Wissen / Notiz speichern", key="save_button"):
-                # Clear any previous messages
-                st.session_state.note_save_message = ""
-                
-                if not manual_title.strip() or not manual_text.strip():
-                    st.warning(
-                        "⚠️ Bitte gib sowohl eine Überschrift als auch einen Text ein."
-                    )
-                else:
-                    existing = (
-                        supabase_client.client.table("rag_pages")
-                        .select("url")
-                        .ilike("url", f"{manual_title.strip()}%")
-                        .execute()
-                    )
-                    if existing.data:
-                        st.warning(
-                            f"⚠️ Ein Eintrag mit der Überschrift '{manual_title.strip()}' existiert bereits."
-                        )
+            # Button-Reihe nebeneinander mit Columns
+            col1, col2, col3 = st.columns([2, 1, 4])
+            with col1:
+                if st.button("✅ Wissen / Notiz speichern", key="save_button"):
+                    # Clear any previous messages
+                    st.session_state.note_save_message = ""
+                    
+                    if not manual_title.strip() or not manual_text.strip():
+                        st.warning("⚠️ Bitte gib sowohl eine Überschrift als auch einen Text ein.")
                     else:
-                        try:
-                            pipeline = DocumentIngestionPipeline()
-                            tz_berlin = pytz.timezone("Europe/Berlin")
-                            now_berlin = datetime.now(tz_berlin)
-                            timestamp = now_berlin.strftime("%Y-%m-%d %H:%M")
-                            
-                            # Erstelle eine Textdatei für die Notiz (bereinige Dateinamen für Supabase)
-                            import re
-                            import unicodedata
-                            
-                            # Schritt 1: Normalisiere Unicode und entferne Akzente/Umlaute
-                            normalized = unicodedata.normalize('NFD', manual_title.strip())
-                            ascii_title = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
-                            
-                            # Schritt 2: Erlaube nur Supabase-konforme Zeichen: a-zA-Z0-9_.-
-                            safe_title = re.sub(r'[^a-zA-Z0-9\s\-_.]', '', ascii_title)
-                            
-                            # Schritt 3: Ersetze Leerzeichen durch Unterstriche
-                            safe_title = re.sub(r'\s+', '_', safe_title)
-                            
-                            # Schritt 4: Entferne mehrfache Unterstriche
-                            safe_title = re.sub(r'_+', '_', safe_title)
-                            
-                            # Schritt 5: Entferne führende/trailing Unterstriche
-                            safe_title = safe_title.strip('_')
-                            
-                            note_filename = f"{safe_title}_{now_berlin.strftime('%Y%m%d_%H%M')}.txt"
-                            note_content = f"Titel: {manual_title.strip()}\nQuelle: {source_type}\nErstellt: {timestamp}\n\n{manual_text}"
-                            
-                            # Speichere Notiz im Storage
-                            storage_success = False
+                        existing = (
+                            supabase_client.client.table("rag_pages")
+                            .select("url")
+                            .ilike("url", f"{manual_title.strip()}%")
+                            .execute()
+                        )
+                        if existing.data:
+                            st.warning(f"⚠️ Ein Eintrag mit der Überschrift '{manual_title.strip()}' existiert bereits.")
+                        else:
                             try:
-                                # UTF-8 mit BOM für bessere Browser-Kompatibilität bei deutschen Umlauten
-                                note_content_bytes = '\ufeff'.encode('utf-8') + note_content.encode('utf-8')
+                                pipeline = DocumentIngestionPipeline()
+                                tz_berlin = pytz.timezone("Europe/Berlin")
+                                now_berlin = datetime.now(tz_berlin)
+                                timestamp = now_berlin.strftime("%Y-%m-%d %H:%M")
                                 
-                                supabase_client.client.storage.from_("privatedocs").upload(
-                                    note_filename,
-                                    note_content_bytes,
-                                    {
-                                        "cacheControl": "3600",
-                                        "x-upsert": "true",
-                                        "content-type": "text/plain; charset=utf-8",
-                                    },
+                                # Erstelle eine Textdatei für die Notiz (bereinige Dateinamen für Supabase)
+                                import re
+                                import unicodedata
+                                
+                                # Schritt 1: Normalisiere Unicode und entferne Akzente/Umlaute
+                                normalized = unicodedata.normalize('NFD', manual_title.strip())
+                                ascii_title = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+                                
+                                # Schritt 2: Erlaube nur Supabase-konforme Zeichen: a-zA-Z0-9_.-
+                                safe_title = re.sub(r'[^a-zA-Z0-9\s\-_.]', '', ascii_title)
+                                
+                                # Schritt 3: Ersetze Leerzeichen durch Unterstriche
+                                safe_title = re.sub(r'\s+', '_', safe_title)
+                                
+                                # Schritt 4: Entferne mehrfache Unterstriche
+                                safe_title = re.sub(r'_+', '_', safe_title)
+                                
+                                # Schritt 5: Entferne führende/trailing Unterstriche
+                                safe_title = safe_title.strip('_')
+                                
+                                note_filename = f"{safe_title}_{now_berlin.strftime('%Y%m%d_%H%M')}.txt"
+                                note_content = f"Titel: {manual_title.strip()}\nQuelle: {source_type}\nErstellt: {timestamp}\n\n{manual_text}"
+                                
+                                # Speichere Notiz im Storage
+                                storage_success = False
+                                try:
+                                    # UTF-8 mit BOM für bessere Browser-Kompatibilität bei deutschen Umlauten
+                                    note_content_bytes = '\ufeff'.encode('utf-8') + note_content.encode('utf-8')
+                                    
+                                    supabase_client.client.storage.from_("privatedocs").upload(
+                                        note_filename,
+                                        note_content_bytes,
+                                        {
+                                            "cacheControl": "3600",
+                                            "x-upsert": "true",
+                                            "content-type": "text/plain; charset=utf-8",
+                                        },
+                                    )
+                                    print(f"✅ Notiz im Storage gespeichert: {note_filename}")
+                                    storage_success = True
+                                except Exception as storage_error:
+                                    print(f"⚠️ Storage-Upload fehlgeschlagen: {storage_error}")
+                                    print(f"   Verwende Fallback ohne Storage-Link")
+                                    # Fahre trotzdem fort - Notiz wird zumindest in der DB gespeichert
+                                
+                                # Metadaten abhängig vom Storage-Erfolg setzen
+                                if storage_success:
+                                    metadata = {
+                                        "source": "manuell",
+                                        "quelle": source_type,
+                                        "title": manual_title.strip(),
+                                        "upload_time": now_berlin.isoformat(),
+                                        "original_filename": note_filename,  # Bereinigter Storage-Dateiname
+                                        "source_filter": "privatedocs",  # Storage verfügbar
+                                        "storage_filename": note_filename,
+                                        "has_storage_file": True,
+                                    }
+                                else:
+                                    metadata = {
+                                        "source": "manuell", 
+                                        "quelle": source_type,
+                                        "title": manual_title.strip(),
+                                        "upload_time": now_berlin.isoformat(),
+                                        "original_filename": manual_title.strip(),  # Fallback: Nur Titel
+                                        "source_filter": "notes",  # Kein Storage verfügbar
+                                        "has_storage_file": False,
+                                    }
+                                result = pipeline.process_text(
+                                    content=manual_text,
+                                    metadata=metadata,
+                                    url=manual_title.strip(),
                                 )
-                                print(f"✅ Notiz im Storage gespeichert: {note_filename}")
-                                storage_success = True
-                            except Exception as storage_error:
-                                print(f"⚠️ Storage-Upload fehlgeschlagen: {storage_error}")
-                                print(f"   Verwende Fallback ohne Storage-Link")
-                                # Fahre trotzdem fort - Notiz wird zumindest in der DB gespeichert
-                            
-                            # Metadaten abhängig vom Storage-Erfolg setzen
-                            if storage_success:
-                                metadata = {
-                                    "source": "manuell",
-                                    "quelle": source_type,
-                                    "title": manual_title.strip(),
-                                    "upload_time": now_berlin.isoformat(),
-                                    "original_filename": note_filename,  # Bereinigter Storage-Dateiname
-                                    "source_filter": "privatedocs",  # Storage verfügbar
-                                    "storage_filename": note_filename,
-                                    "has_storage_file": True,
-                                }
-                            else:
-                                metadata = {
-                                    "source": "manuell", 
-                                    "quelle": source_type,
-                                    "title": manual_title.strip(),
-                                    "upload_time": now_berlin.isoformat(),
-                                    "original_filename": manual_title.strip(),  # Fallback: Nur Titel
-                                    "source_filter": "notes",  # Kein Storage verfügbar
-                                    "has_storage_file": False,
-                                }
-                            result = pipeline.process_text(
-                                content=manual_text,
-                                metadata=metadata,
-                                url=manual_title.strip(),
-                            )
-                            # Set success message instead of toast
-                            st.session_state.note_save_message = "✅ Wissen/Notizen erfolgreich gespeichert"
-                            await update_available_sources()
-                            st.session_state.manual_title = ""
-                            st.session_state.manual_text = ""
-                            st.session_state.manual_source = "Beratung"
-                            st.rerun()
-                        except Exception as e:
-                            # Set error message instead of direct error display
-                            st.session_state.note_save_message = f"❌ Fehler beim Speichern des Wissens/der Notiz: {e}"
+                                # Set success message instead of toast
+                                st.session_state.note_save_message = "✅ Wissen/Notizen erfolgreich gespeichert"
+                                await update_available_sources()
+                                st.session_state.manual_title = ""
+                                st.session_state.manual_text = ""
+                                st.session_state.manual_source = "Beratung"
+                                st.rerun()
+                            except Exception as e:
+                                # Set error message instead of direct error display
+                                st.session_state.note_save_message = f"❌ Fehler beim Speichern des Wissens/der Notiz: {e}"
 
-        with col2:
-            if st.button("🧹 Eingaben leeren", key="clear_button"):
-                st.session_state.manual_title = ""
-                st.session_state.manual_text = ""
-                st.session_state.manual_source = "Beratung"
-                st.session_state.note_save_message = ""  # Clear success message
-                st.rerun()
-        
-        with col3:
-            # Leere Spalte für Abstand
-            pass
+            with col2:
+                if st.button("🧹 Eingaben leeren", key="clear_button"):
+                    st.session_state.manual_title = ""
+                    st.session_state.manual_text = ""
+                    st.session_state.manual_source = "Beratung"
+                    st.session_state.note_save_message = ""  # Clear success message
+                    st.rerun()
+            
+            with col3:
+                # Leere Spalte für Abstand
+                pass
             
             # Display success/error message below buttons
             if st.session_state.note_save_message:
@@ -859,7 +1041,7 @@ async def main():
                     st.error(st.session_state.note_save_message)
                 else:
                     st.info(st.session_state.note_save_message)
-        
+
         with knowledge_tab2:
             st.markdown(
                 """
