@@ -156,6 +156,7 @@ async def process_document(
     loop = asyncio.get_event_loop()
 
     try:
+        
         chunks = await loop.run_in_executor(
             None,
             lambda: pipeline.process_file(file_path, metadata),
@@ -802,51 +803,147 @@ async def main():
             unsafe_allow_html=True,
         )
 
-        if uploaded_files and not st.session_state.just_uploaded:
-            new_files = [
+        if uploaded_files:
+            # Create file list with all uploaded files (new and already processed)
+            all_uploaded_files = [
                 (f, f"{f.name}_{hash(f.getvalue().hex())}")
                 for f in uploaded_files
-                if f"{f.name}_{hash(f.getvalue().hex())}"
-                not in st.session_state.processed_files
+            ]
+            
+            # Always clear old upload table when new files are selected for upload
+            # This ensures clean state for each new upload session
+            current_file_names = sorted([f.name for f in uploaded_files])
+            last_selection = st.session_state.get("last_file_selection", [])
+            
+            if current_file_names != last_selection:
+                # New or different file selection detected - clear old upload table
+                print(f"🗑️ Neue Dateiauswahl erkannt, lösche alte Upload-Tabelle")
+                if "upload_status_table" in st.session_state:
+                    del st.session_state.upload_status_table
+                if "just_uploaded" in st.session_state:
+                    st.session_state.just_uploaded = False
+                # Clear all old selection keys to prevent conflicts
+                keys_to_remove = [key for key in st.session_state.keys() if key.startswith("selection_")]
+                for key in keys_to_remove:
+                    del st.session_state[key]
+                st.session_state.last_file_selection = current_file_names
+            
+            # Separate new files from already processed ones
+            new_files = [
+                (f, file_id) for f, file_id in all_uploaded_files
+                if file_id not in st.session_state.processed_files
+            ]
+            
+            already_processed_files = [
+                (f, file_id) for f, file_id in all_uploaded_files
+                if file_id in st.session_state.processed_files
             ]
 
-            if new_files:
-                st.subheader("⏳ Upload-Fortschritt")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
+            # Only process if we have new files to upload
+            if new_files and not st.session_state.get("currently_uploading", False):
+                # Set upload in progress flag
+                st.session_state.currently_uploading = True
+                
+                st.subheader("⏳ Upload-Status")
+                
+                # Clear old upload status table for new upload
+                st.session_state.upload_status_table = []
+                
+                # Create initial table data for ALL files (new and already processed)
+                table_data = []
+                
+                # Add new files to table
+                for uploaded_file, file_id in new_files:
+                    # Check file type first
+                    file_ext = uploaded_file.name.lower().split('.')[-1] if '.' in uploaded_file.name else ''
+                    if file_ext not in ['pdf', 'txt']:
+                        table_data.append({
+                            'Dateiname': uploaded_file.name,
+                            'Fortschritt': 'Ungültiger Dateityp',
+                            'Status': '❌ Error'
+                        })
+                    else:
+                        table_data.append({
+                            'Dateiname': uploaded_file.name,
+                            'Fortschritt': '0%',
+                            'Status': '⏳ Wartend'
+                        })
+                
+                # Add already processed files to table
+                for uploaded_file, file_id in already_processed_files:
+                    table_data.append({
+                        'Dateiname': uploaded_file.name,
+                        'Fortschritt': 'Bereits in dieser Session verarbeitet',
+                        'Status': '✅ Bereits hochgeladen'
+                    })
+                
+                # Create table placeholder
+                table_placeholder = st.empty()
+                
+                # Display initial table
+                table_placeholder.table(table_data)
+                
+                # Process each NEW file (skip already processed ones)
                 for i, (uploaded_file, file_id) in enumerate(new_files):
-                    safe_filename = sanitize_filename(uploaded_file.name)
-
-                    file_bytes = uploaded_file.getvalue()
-                    file_hash = compute_file_hash(file_bytes)
-
-                    # 🔍 Duplikatprüfung anhand Hash
-                    existing_hash = (
-                        supabase_client.client.table("rag_pages")
-                        .select("id")
-                        .eq("metadata->>file_hash", file_hash)
-                        .execute()
-                    )
-
-                    if existing_hash.data:
-                        st.warning(
-                            f"⚠️ Die Datei **{safe_filename}** wurde bereits (unter anderem Namen) hochgeladen und wird nicht erneut gespeichert."
-                        )
+                    # Helper function to update table
+                    def update_table_row(filename, progress, status):
+                        for row in table_data:
+                            if row['Dateiname'] == filename:
+                                row['Fortschritt'] = progress
+                                row['Status'] = status
+                                break
+                        table_placeholder.table(table_data)
+                    
+                    # Check file type first
+                    file_ext = uploaded_file.name.lower().split('.')[-1] if '.' in uploaded_file.name else ''
+                    if file_ext not in ['pdf', 'txt']:
+                        update_table_row(uploaded_file.name, f'Nur PDF und TXT erlaubt', '❌ Error')
                         continue
+                    
+                    safe_filename = sanitize_filename(uploaded_file.name)
+                    update_table_row(uploaded_file.name, '5%', '🔄 Prüfung...')
 
-                    # ✅ Duplikatprüfung vor Upload
-                    existing = (
-                        supabase_client.client.table("rag_pages")
-                        .select("id")
-                        .eq("url", safe_filename)
-                        .execute()
-                    )
+                    try:
+                        # Check file size (200MB limit as per UI)
+                        if uploaded_file.size > 200 * 1024 * 1024:  # 200MB
+                            update_table_row(uploaded_file.name, 'Datei zu groß (>200MB)', '❌ Error')
+                            continue
+                        
+                        file_bytes = uploaded_file.getvalue()
+                        
+                        # Check if file is empty
+                        if len(file_bytes) == 0:
+                            update_table_row(uploaded_file.name, 'Datei ist leer', '❌ Error')
+                            continue
+                            
+                        file_hash = compute_file_hash(file_bytes)
 
-                    if existing.data:
-                        st.warning(
-                            f"⚠️ Die Datei **{safe_filename}** ist bereits in der Wissensdatenbank vorhanden und wurde nicht erneut hochgeladen."
+                        # 🔍 Duplikatprüfung anhand Hash
+                        existing_hash = (
+                            supabase_client.client.table("rag_pages")
+                            .select("id")
+                            .eq("metadata->>file_hash", file_hash)
+                            .execute()
                         )
+
+                        if existing_hash.data:
+                            update_table_row(uploaded_file.name, 'Bereits vorhanden (Hash-Duplikat)', '⚠️ Übersprungen')
+                            continue
+
+                        # ✅ Duplikatprüfung vor Upload
+                        existing = (
+                            supabase_client.client.table("rag_pages")
+                            .select("id")
+                            .eq("url", safe_filename)
+                            .execute()
+                        )
+
+                        if existing.data:
+                            update_table_row(uploaded_file.name, 'Bereits in Datenbank vorhanden', '⚠️ Übersprungen')
+                            continue
+                    
+                    except Exception as e:
+                        update_table_row(uploaded_file.name, f'Fehler bei Prüfung: {str(e)}', '❌ Error')
                         continue
 
                     with tempfile.NamedTemporaryFile(
@@ -856,10 +953,7 @@ async def main():
                         temp_file_path = temp_file.name
 
                     try:
-                        progress_bar.progress(0.05)
-                        status_text.markdown(
-                            f"🟡 **{safe_filename}**: 📥 *Upload startet...*"
-                        )
+                        update_table_row(uploaded_file.name, '10%', '📥 Upload startet...')
 
                         # Content-Type dynamisch bestimmen
                         mime_type, _ = mimetypes.guess_type(safe_filename)
@@ -869,6 +963,10 @@ async def main():
                         # Für TXT-Dateien explizit UTF-8 Encoding setzen
                         if safe_filename.lower().endswith('.txt'):
                             mime_type = "text/plain; charset=utf-8"
+                        
+                        # Storage upload with error handling
+                        storage_success = False
+                        storage_error_msg = ""
                         
                         # Für TXT-Dateien spezielles UTF-8 Handling
                         if safe_filename.lower().endswith('.txt'):
@@ -893,6 +991,7 @@ async def main():
                                         "content-type": mime_type,
                                     },
                                 )
+                                storage_success = True
                             except UnicodeDecodeError:
                                 # Fallback: Versuche andere Encodings
                                 encodings = ["latin-1", "cp1252", "ascii"]
@@ -905,91 +1004,143 @@ async def main():
                                     except UnicodeDecodeError:
                                         continue
                                 
-                                if content:
-                                    # Als UTF-8 Bytes mit BOM hochladen (konvertiert von anderem Encoding, wie bei Notizen)
-                                    content_bytes = '\ufeff'.encode('utf-8') + content.encode('utf-8')
-                                    print(f"🔍 Debug: TXT-Datei Fallback Upload - Content length: {len(content_bytes)} bytes (with BOM)")
-                                    supabase_client.client.storage.from_("privatedocs").upload(
-                                        safe_filename,
-                                        content_bytes,
-                                        {
-                                            "cacheControl": "3600",
-                                            "x-upsert": "true",
-                                            "content-type": mime_type,
-                                        },
-                                    )
-                                else:
-                                    # Letzter Fallback: Als Bytes hochladen
-                                    with open(temp_file_path, "rb") as f:
+                                try:
+                                    if content:
+                                        # Als UTF-8 Bytes mit BOM hochladen (konvertiert von anderem Encoding, wie bei Notizen)
+                                        content_bytes = '\ufeff'.encode('utf-8') + content.encode('utf-8')
+                                        print(f"🔍 Debug: TXT-Datei Fallback Upload - Content length: {len(content_bytes)} bytes (with BOM)")
                                         supabase_client.client.storage.from_("privatedocs").upload(
                                             safe_filename,
-                                            f.read(),
+                                            content_bytes,
                                             {
                                                 "cacheControl": "3600",
                                                 "x-upsert": "true",
                                                 "content-type": mime_type,
                                             },
                                         )
+                                        storage_success = True
+                                except Exception as encoding_error:
+                                    storage_error_msg = f"Encoding-Upload Fehler: {str(encoding_error)}"
+                                    print(f"❌ TXT Encoding-Upload Fehler für {safe_filename}: {encoding_error}")
+                                    
+                                if not storage_success:
+                                    # Letzter Fallback: Als Bytes hochladen
+                                    try:
+                                        with open(temp_file_path, "rb") as f:
+                                            supabase_client.client.storage.from_("privatedocs").upload(
+                                                safe_filename,
+                                                f.read(),
+                                                {
+                                                    "cacheControl": "3600",
+                                                    "x-upsert": "true",
+                                                    "content-type": mime_type,
+                                                },
+                                            )
+                                            storage_success = True
+                                    except Exception as final_error:
+                                        storage_error_msg = f"Finaler Fallback-Fehler: {str(final_error)}"
+                                        print(f"❌ Finaler Fallback-Fehler für {safe_filename}: {final_error}")
                         else:
                             # Andere Dateitypen normal als Bytes hochladen
-                            with open(temp_file_path, "rb") as f:
-                                supabase_client.client.storage.from_("privatedocs").upload(
-                                    safe_filename,
-                                    f.read(),  # Bytes, nicht Handle
-                                    {
-                                        "cacheControl": "3600",
-                                        "x-upsert": "true",
-                                        "content-type": mime_type,
-                                    },
-                                )
+                            try:
+                                with open(temp_file_path, "rb") as f:
+                                    supabase_client.client.storage.from_("privatedocs").upload(
+                                        safe_filename,
+                                        f.read(),  # Bytes, nicht Handle
+                                        {
+                                            "cacheControl": "3600",
+                                            "x-upsert": "true",
+                                            "content-type": mime_type,
+                                        },
+                                    )
+                                    storage_success = True
+                            except Exception as storage_error:
+                                storage_error_msg = str(storage_error)
+                                print(f"❌ Storage-Upload Fehler für {safe_filename}: {storage_error}")
 
-                        progress_bar.progress(0.3)
-                        status_text.markdown(
-                            f"🟠 **{safe_filename}**: 📤 *Dateiübertragung abgeschlossen*"
-                        )
+                        if not storage_success:
+                            update_table_row(uploaded_file.name, f'Storage-Fehler: {storage_error_msg}', '❌ Error')
+                            continue
+                            
+                        update_table_row(uploaded_file.name, '30%', '📤 Dateiübertragung abgeschlossen')
 
                         metadata = {
                             "source": "ui_upload",
                             "upload_time": str(datetime.now()),
                             "original_filename": safe_filename,
                             "file_hash": file_hash,
+                            "source_filter": "privatedocs",  # This might be missing
                         }
 
-                        status_text.markdown(
-                            f"🔵 **{safe_filename}**: 🧠 *Verarbeitung läuft...*"
-                        )
+                        update_table_row(uploaded_file.name, '50%', '🧠 Verarbeitung läuft...')
 
                         result = await process_document(
                             temp_file_path, safe_filename, metadata
                         )
 
-                        progress_bar.progress(0.8)
+                        update_table_row(uploaded_file.name, '80%', '🔄 Finalisierung...')
 
                         if result["success"]:
-                            st.success(
-                                f"✅ {uploaded_file.name} verarbeitet: {result['chunk_count']} Textabschnitte"
-                            )
-                            st.session_state.document_count += 1
+                            update_table_row(uploaded_file.name, f'✅ {result["chunk_count"]} Textabschnitte', '✅ Hochgeladen')
                             st.session_state.processed_files.add(file_id)
                         else:
-                            st.error(
-                                f"❌ Fehler beim Verarbeiten {uploaded_file.name}: {result['error']}"
-                            )
+                            update_table_row(uploaded_file.name, f'Verarbeitungsfehler: {result["error"]}', '❌ Error')
 
-                        progress_bar.progress(1.0)
-                        status_text.markdown(
-                            f"🟢 **{safe_filename}**: ✅ *Verarbeitung abgeschlossen*"
-                        )
-
+                    except Exception as e:
+                        update_table_row(uploaded_file.name, f'Unerwarteter Fehler: {str(e)}', '❌ Error')
+                        print(f"❌ Unerwarteter Fehler beim Verarbeiten von {uploaded_file.name}: {e}")
                     finally:
-                        os.unlink(temp_file_path)
+                        if 'temp_file_path' in locals():
+                            try:
+                                os.unlink(temp_file_path)
+                            except:
+                                pass  # Ignore cleanup errors
+                
+                # Store table in session state for persistence
+                st.session_state.upload_status_table = table_data
+                
+                # Final message
+                successful_uploads = sum(1 for row in table_data if row['Status'] == '✅ Hochgeladen')
+                already_uploaded = sum(1 for row in table_data if row['Status'] == '✅ Bereits hochgeladen')
+                total_new_files = len(new_files)
+                total_files = len(table_data)
+                
+                if total_new_files == 0 and already_uploaded > 0:
+                    st.info(f"ℹ️ Alle {already_uploaded} ausgewählte(n) Datei(en) wurden bereits in dieser Session hochgeladen.")
+                elif successful_uploads == total_new_files and total_new_files > 0:
+                    st.success(f"🎉 Alle {total_new_files} neue(n) Datei(en) erfolgreich hochgeladen!")
+                elif successful_uploads > 0:
+                    st.warning(f"⚠️ {successful_uploads} von {total_new_files} neue(n) Datei(en) erfolgreich hochgeladen.")
+                elif total_new_files > 0:
+                    st.error(f"❌ Keine der {total_new_files} neue(n) Datei(en) konnten hochgeladen werden.")
 
+                # Reset upload flags
                 st.session_state.just_uploaded = True
+                st.session_state.currently_uploading = False
+                
+                # Aktualisiere Quellen explizit nach Upload
                 await update_available_sources()
+                print(f"🔄 Nach Upload: {st.session_state.get('document_count', 0)} Dokumente, {st.session_state.get('knowledge_count', 0)} Notizen")
+                
+                # Seite neu laden damit Header mit aktualisierten Zählern angezeigt wird
                 st.rerun()
 
-            else:
+            elif already_processed_files and not new_files:
                 st.info("Alle Dateien wurden bereits verarbeitet")
+        
+        # Display persistent upload status table if it exists (but not during active upload)
+        elif ("upload_status_table" in st.session_state and 
+              st.session_state.upload_status_table and 
+              not st.session_state.get("currently_uploading", False)):
+            st.subheader("📊 Letzter Upload-Status")
+            st.table(st.session_state.upload_status_table)
+            
+            if st.button("🧹 Upload-Historie löschen", key="clear_upload_history"):
+                del st.session_state.upload_status_table
+                # Reset flags when clearing history
+                if "just_uploaded" in st.session_state:
+                    st.session_state.just_uploaded = False
+                st.rerun()
 
         st.markdown(
             "<hr style='margin-top: 6px; margin-bottom: 6px;'>", unsafe_allow_html=True
@@ -1091,19 +1242,36 @@ async def main():
                                     if signed_url and signed_url != "#":
                                         st.markdown("**PDF-Inhalt:**")
                                         
-                                        # Use Google Docs viewer for better browser compatibility
-                                        google_viewer_url = f"https://docs.google.com/viewer?url={signed_url}&embedded=true"
+                                        # Try multiple PDF viewer approaches for maximum compatibility
+                                        
+                                        # Approach 1: Try Mozilla PDF.js viewer first (most reliable)
+                                        pdfjs_url = f"https://mozilla.github.io/pdf.js/web/viewer.html?file={signed_url}"
                                         
                                         st.components.v1.html(
                                             f"""
                                             <div style="width: 100%; height: 800px; border: 1px solid #ccc; border-radius: 6px; margin-top: 10px; position: relative;">
                                                 <iframe 
-                                                    src="{google_viewer_url}" 
+                                                    src="{pdfjs_url}" 
                                                     width="100%" 
                                                     height="100%" 
                                                     style="border: none; border-radius: 6px;"
-                                                    frameborder="0">
+                                                    frameborder="0"
+                                                    onload="console.log('PDF.js loaded successfully')"
+                                                    onerror="console.error('PDF.js failed to load'); this.style.display='none'; document.getElementById('fallback-{hash(signed_url)}').style.display='block';">
                                                 </iframe>
+                                                
+                                                <!-- Fallback for when PDF.js doesn't work -->
+                                                <div id="fallback-{hash(signed_url)}" style="display: none; padding: 20px; text-align: center; height: 100%;">
+                                                    <div style="margin-top: 200px;">
+                                                        <h3>PDF-Vorschau nicht verfügbar</h3>
+                                                        <p>Der PDF-Viewer konnte nicht geladen werden.</p>
+                                                        <a href="{signed_url}" target="_blank" 
+                                                           style="display: inline-block; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; font-size: 16px;">
+                                                            📄 PDF in neuem Tab öffnen
+                                                        </a>
+                                                    </div>
+                                                </div>
+                                                
                                                 <div style="position: absolute; bottom: 0; left: 0; right: 0; text-align: center; padding: 5px; background: rgba(248,249,250,0.9); border-top: 1px solid #dee2e6;">
                                                     <small>
                                                         <a href="{signed_url}" target="_blank" style="color: #007bff; text-decoration: none;">
@@ -1243,6 +1411,13 @@ async def main():
 
                 if storage_deleted and db_deleted:
                     st.success("✅ Vollständig gelöscht.")
+                    # Remove from processed files list so it can be re-uploaded
+                    if "processed_files" in st.session_state:
+                        # Remove all entries that match this filename
+                        files_to_remove = [f for f in st.session_state.processed_files if delete_filename in f]
+                        for file_to_remove in files_to_remove:
+                            st.session_state.processed_files.discard(file_to_remove)
+                            print(f"🧹 Entfernt aus processed_files: {file_to_remove}")
                 elif storage_deleted and not db_deleted:
                     st.warning(
                         "⚠️ Dokument/Notiz im Storage gelöscht, aber kein Eintrag in der Datenbank gefunden."
