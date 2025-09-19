@@ -378,9 +378,25 @@ def _chat_history_df(chat_history: List[Dict]) -> pd.DataFrame:
 
 
 def render_chat_history():
-    """Rendert die Chat-Historie mit Suche (oben), Tabelle links und Details rechts."""
+    """Rendert die Chat-Historie mit Suchfunktion + klickbarer Tabelle"""
 
-    # ── Daten holen ────────────────────────────────────────────────────────────────
+    # --- Zeile 1: Suche ---
+    top1, top2 = st.columns([4, 1])
+    with top1:
+        search_term = st.text_input(
+            "🔍 Suche in Fragen (Wildcard-Suche)",
+            value=st.session_state.get("chat_history_search", ""),
+            key="chat_history_search_input",
+        )
+    with top2:
+        # leichtes Downshift, damit Button auf Höhe des Eingabefeldes sitzt
+        st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
+        if st.button("🔍 Suchen", key="search_chat_history", use_container_width=True):
+            st.session_state.chat_history_search = search_term
+            st.session_state.selected_chat_id = None  # Selektion zurücksetzen
+            st.rerun()
+
+    # --- Daten holen ---
     chat_history = get_chat_history(st.session_state.get("chat_history_search", ""))
 
     if not chat_history:
@@ -392,111 +408,99 @@ def render_chat_history():
             st.info("Keine Chat-Historie verfügbar.")
         return
 
-    # ── Zeile 2: Liste (links) + Details (rechts) → links 1/3, rechts 2/3 ──────────
+    # --- Zeile 2: Liste (links) + Details (rechts) ---
     col_list, col_detail = st.columns([1, 2])
 
-    # ── Linke Spalte: Tabelle / AgGrid ─────────────────────────────────────────────
+    # ----- Linke Spalte: Tabelle/AgGrid -----
     with col_list:
         st.markdown("**Chat-Liste:**")
+        chat_df = _chat_history_df(chat_history)  # id, Datum, Frage
 
-        chat_df = _chat_history_df(chat_history)  # erwartet: id, Datum, Frage
-        if "Datum" not in chat_df.columns and "Zeit" in chat_df.columns:
-            chat_df = chat_df.rename(columns={"Zeit": "Datum"})
-        grid_df = chat_df[["Datum", "Frage", "id"]].reset_index(drop=True)
+        # Debug: Spalten-Info ausgeben
+        print(f"🔍 Debug: DataFrame Spalten: {list(chat_df.columns)}")
+        print(f"🔍 Debug: DataFrame Shape: {chat_df.shape}")
 
         if AGGRID:
-            # --- Grid-Definition: genau ZWEI sichtbare Spalten (Datum, Frage) ---
-            gb = GridOptionsBuilder.from_dataframe(grid_df)
-            gb.configure_column("id", hide=True)  # bleibt für Selektion vorhanden
-            gb.configure_column("Datum", headerName="Datum", width=120, resizable=True)
+            # Nur die gewünschten Spalten für die Anzeige verwenden
+            display_df = chat_df[["id", "Datum", "Frage"]].copy()
+
+            gb = GridOptionsBuilder.from_dataframe(display_df)
+            gb.configure_column("id", hide=True)
+            gb.configure_column("Datum", width=100, headerName="Datum")
             gb.configure_column(
-                "Frage",
-                headerName="Frage",
-                flex=1,  # füllt restliche Breite → keine leere dritte Spalte
-                wrapText=True,
-                autoHeight=True,
+                "Frage", wrapText=True, autoHeight=True, headerName="Frage"
             )
-            gb.configure_default_column(resizable=True, sortable=True, filter=True)
             gb.configure_selection(selection_mode="single", use_checkbox=False)
             gb.configure_grid_options(
-                rowHeight=28,  # kompakt
+                rowHeight=28,  # Kleinere Zeilenhöhe für mehr Einträge
                 suppressRowClickSelection=False,
                 animateRows=False,
                 domLayout="autoHeight",
+                onSelectionChanged="function(event) { console.log('Selection changed:', event.api.getSelectedRows()); }",
             )
 
-            # EINDEUTIGER KEY – nur EIN Grid in dieser Funktion
-            grid_key = "chat_history_grid_v5"
-
-            # robust gegenüber neuen/alten st-aggrid-Versionen
             try:
                 grid = AgGrid(
-                    grid_df,
+                    display_df,
                     gridOptions=gb.build(),
-                    update_on=["SELECTION_CHANGED"],  # neuer Parameter (bevorzugt)
+                    update_mode="SELECTION_CHANGED",  # String statt deprecated Enum
                     fit_columns_on_grid_load=True,
                     allow_unsafe_jscode=True,
                     enable_enterprise_modules=False,
                     theme="alpine",
-                    key=grid_key,
-                )
-            except TypeError:
-                # Fallback für ältere Versionen
-                grid = AgGrid(
-                    grid_df,
-                    gridOptions=gb.build(),
-                    update_mode="SELECTION_CHANGED",
-                    fit_columns_on_grid_load=True,
-                    allow_unsafe_jscode=True,
-                    enable_enterprise_modules=False,
-                    theme="alpine",
-                    key=grid_key,
+                    key="chat_history_grid",
+                    reload_data=False,
                 )
 
-            # Selektion übernehmen (kompatibel über verschiedene st-aggrid-Versionen)
-            selected_rows = []
-            if isinstance(grid, dict):
-                selected_rows = grid.get("selected_rows") or grid.get("selectedRows") or []
-            else:
-                selected_rows = getattr(grid, "selected_rows", []) or getattr(
-                    grid, "selectedRows", []
-                )
-            
-            # Debug-Output für Troubleshooting
-            print(f"🔍 DEBUG Chat Selection:")
-            print(f"   Grid type: {type(grid)}")
-            print(f"   Selected rows: {selected_rows}")
-            print(f"   Current selected_chat_id: {st.session_state.get('selected_chat_id')}")
-            
-            if selected_rows:
-                sel_id = selected_rows[0].get("id")
-                print(f"   New sel_id from grid: {sel_id}")
-                if sel_id and sel_id != st.session_state.get("selected_chat_id"):
-                    print(f"   ✅ Setting new selected_chat_id: {sel_id}")
-                    st.session_state.selected_chat_id = sel_id
-                    st.rerun()
-                else:
-                    print(f"   ⚠️ sel_id is same as current or empty")
-            else:
-                print(f"   ⚠️ No rows selected")
+                # Debug: Grid-Objekt untersuchen
+                print(f"🔍 Debug: Grid type: {type(grid)}")
+                if hasattr(grid, "selected_rows"):
+                    print(f"🔍 Debug: Selected rows: {grid.selected_rows}")
 
-            # Optik dezent verdichten
+                # Selektion übernehmen - verbesserte Logik
+                if (
+                    hasattr(grid, "selected_rows")
+                    and grid.selected_rows is not None
+                    and len(grid.selected_rows) > 0
+                ):
+                    selected_row = grid.selected_rows[0]
+                    sel_id = selected_row.get("id")
+                    print(f"🔍 Debug: AgGrid Selektion - ID: {sel_id}")
+                    if sel_id and sel_id != st.session_state.get("selected_chat_id"):
+                        st.session_state.selected_chat_id = sel_id
+                        print(f"🔄 Chat-ID {sel_id} ausgewählt, aktualisiere UI")
+                        st.rerun()
+
+            except Exception as e:
+                print(f"❌ AgGrid Fehler: {e}")
+                st.error(f"Fehler bei der Tabellendarstellung: {e}")
+
             st.markdown(
                 """
-                <style>
-                .ag-theme-alpine .ag-cell { padding: 2px 4px !important; font-size: 12px !important; line-height: 1.2 !important; }
-                .ag-theme-alpine .ag-header-cell-label { padding: 2px 4px !important; font-size: 12px !important; font-weight: 600 !important; }
-                .ag-theme-alpine .ag-row { min-height: 28px !important; }
-                </style>
-                """,
+            <style>
+            .ag-theme-alpine .ag-cell { 
+                padding: 2px 4px !important; 
+                font-size: 12px !important;  /* Kleinere Schrift */
+                line-height: 1.2 !important;
+            }
+            .ag-theme-alpine .ag-header-cell-label { 
+                padding: 2px 4px !important; 
+                font-size: 12px !important;  /* Kleinere Header-Schrift */
+                font-weight: 600 !important;
+            }
+            .ag-theme-alpine .ag-row {
+                min-height: 28px !important;  /* Kleinere Zeilenhöhe */
+            }
+            </style>
+            """,
                 unsafe_allow_html=True,
             )
 
         else:
-            # --- Fallback ohne AgGrid: Radio-Liste, ebenfalls nur 2 sichtbare Spalten in der Darstellung ---
-            options = grid_df["id"].tolist()
+            # Fallback ohne AgGrid
+            options = chat_df["id"].tolist()
             labels = [
-                f"{row['Datum']} — {row['Frage']}" for _, row in grid_df.iterrows()
+                f'{row["Datum"]} — {row["Frage"]}' for _, row in chat_df.iterrows()
             ]
             current = st.session_state.get("selected_chat_id")
             idx = (
@@ -515,15 +519,20 @@ def render_chat_history():
             else:
                 st.info("Keine Einträge.")
 
-    # ── Rechte Spalte: Chat-Details ────────────────────────────────────────────────
+    # ----- Rechte Spalte: Details -----
     with col_detail:
         st.markdown("**Chat-Details:**")
         sel_id = st.session_state.get("selected_chat_id")
+        print(f"🔍 Debug: Aktuelle selected_chat_id: {sel_id}")
         if sel_id:
             selected_chat = next(
                 (c for c in chat_history if c.get("id") == sel_id), None
             )
+            print(f"🔍 Debug: Gefundener Chat: {selected_chat is not None}")
             if selected_chat:
+                print(
+                    f"🔍 Debug: Chat-Frage: {selected_chat.get('question', '')[:50]}..."
+                )
                 with st.chat_message("user"):
                     st.markdown(selected_chat.get("question", ""))
                 with st.chat_message("assistant"):
@@ -531,7 +540,7 @@ def render_chat_history():
             else:
                 st.info("Chat nicht gefunden.")
         else:
-            st.info("Wähle links einen Eintrag aus, um Frage & Antwort zu sehen.")
+            st.info("Wählen Sie einen Chat aus der Liste aus, um die Details zu sehen.")
 
 
 async def update_available_sources():
