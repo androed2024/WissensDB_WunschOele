@@ -328,6 +328,45 @@ class DocumentIngestionPipeline:
         embedding_generator = EmbeddingGenerator()
         supabase = SupabaseClient()
 
+        # --- NEW: document_metadata-Eintrag für manuelle Notizen ---
+        # Annahmen: metadata enthält von der App:
+        #  - "title": Titel der Notiz
+        #  - "quelle": Kategorie ("Wissen", "Beratung", ...)
+        #  - optional "original_filename" / "storage_filename" wenn in Storage geschrieben
+        from datetime import datetime, timezone
+
+        manual_title = (metadata.get("title") or (url or "Notiz")).strip()
+        category = metadata.get("quelle") or "Notiz"
+
+        # Quelle/URL robust bestimmen (nie NULL)
+        source_url = (
+            metadata.get("storage_filename")
+            or metadata.get("original_filename")
+            or (url or manual_title)
+        )
+
+        doc_row = {
+            "title": manual_title,
+            "source_url": source_url,
+            "doc_type": category,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "extra": {
+                "is_manual": True,
+                "category": category,
+            },
+        }
+
+        try:
+            # Upsert optional: wenn du Duplikate pro (source_url, created_at) verhindern willst,
+            # kannst du `on_conflict="source_url,created_at"` verwenden – falls es dafür
+            # einen UNIQUE-Index gibt. Ohne UNIQUE bitte einfach .insert().
+            doc_ins = supabase.client.table("document_metadata").insert(doc_row).execute()
+            # Wenn du die doc_id für chunk_id o.Ä. brauchst:
+            # doc_id = doc_ins.data[0]["doc_id"]
+        except Exception as e:
+            logger.error(f"failed to insert manual note into document_metadata: {e}")
+        # --- END NEW ---
+
         chunks = chunker.chunk_text(content)
         for chunk in chunks:
             chunk["metadata"] = metadata
