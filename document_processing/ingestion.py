@@ -18,6 +18,7 @@ from document_processing.chunker import TextChunker
 from document_processing.embeddings import EmbeddingGenerator
 from document_processing.processors import get_document_processor
 from document_processing.segmenter import AgenticSegmenter
+from document_processing.tokens import count_tokens
 from database.setup import SupabaseClient
 
 # Set up logging
@@ -472,33 +473,132 @@ class DocumentIngestionPipeline:
                 # WICHTIG: Nicht abbrechen - Chunks trotzdem speichern!
 
         # Chunking und Embedding - IMMER ausführen, auch wenn document_metadata fehlschlägt
-        chunks = chunker.chunk_text(content)
-        for chunk in chunks:
-            chunk["metadata"] = metadata.copy()
-            # Erweitere Chunk-Metadaten für manuelle Notizen
-            if metadata.get("is_manual") and note_hash:
+        
+        # Determine chunking strategy for manual notes
+        chunks = []
+        chunking_method = "classic"  # Default
+        
+        if metadata.get("is_manual"):
+            # Check if we should use agentic chunking for this note
+            
+            enable_agentic = os.getenv('RAG_ENABLE_AGENTIC_FOR_NOTES', 'true').lower() == 'true'
+            min_tokens_for_agentic = int(os.getenv('RAG_NOTE_AGENTIC_MIN_TOKENS', '300'))
+            
+            note_tokens = count_tokens(content)
+            
+            if enable_agentic and note_tokens >= min_tokens_for_agentic:
+                # Use agentic segmentation for long notes
+                chunking_method = "agentic"
+                note_title = metadata.get("title") or url or "Notiz"
+                chunks = self.segmenter.segment_text(content, title=note_title)
+                
+                # Add consistent metadata to all chunks
+                for chunk in chunks:
+                    chunk["metadata"] = metadata.copy()
+                    chunk["metadata"]["is_manual"] = True
+                    if note_hash:
+                        chunk["metadata"]["note_hash"] = note_hash
+                    chunk["metadata"]["category"] = metadata.get("quelle", "Notiz")
+                    
+                logger.info(f"Manual note: agentic=Yes, tokens={note_tokens}, chunks={len(chunks)}")
+            else:
+                # Use classic chunking for short notes
+                chunking_method = "classic"
+                chunks = chunker.chunk_text(content)
+                
+                # Add metadata and set default values for compatibility
+                for chunk in chunks:
+                    chunk["metadata"] = metadata.copy()
+                    chunk["metadata"]["is_manual"] = True
+                    if note_hash:
+                        chunk["metadata"]["note_hash"] = note_hash
+                    chunk["metadata"]["category"] = metadata.get("quelle", "Notiz")
+                    
+                    # Set default values for classic chunks to match agentic format
+                    chunk["page"] = 1
+                    chunk["page_heading"] = metadata.get("title") or url or "Notiz"
+                    chunk["section_heading"] = None
+                    chunk["token_count"] = count_tokens(chunk["text"])
+                
+                logger.info(f"Manual note: agentic=No (tokens={note_tokens} < {min_tokens_for_agentic}), chunks={len(chunks)}")
+        else:
+            # Non-manual content - use classic chunking
+            chunks = chunker.chunk_text(content)
+            for chunk in chunks:
+                chunk["metadata"] = metadata.copy()
+                # Set default values for non-manual chunks
+                chunk.setdefault("page", 1)
+                chunk.setdefault("page_heading", None)
+                chunk.setdefault("section_heading", None)
+                chunk.setdefault("token_count", count_tokens(chunk["text"]))
+        
+        # Fallback: If segmenter returns empty, use classic chunker
+        if not chunks and metadata.get("is_manual"):
+            logger.warning("Agentic segmenter returned no chunks, falling back to classic chunker")
+            chunks = chunker.chunk_text(content)
+            for chunk in chunks:
+                chunk["metadata"] = metadata.copy()
                 chunk["metadata"]["is_manual"] = True
-                chunk["metadata"]["note_hash"] = note_hash
+                if note_hash:
+                    chunk["metadata"]["note_hash"] = note_hash
                 chunk["metadata"]["category"] = metadata.get("quelle", "Notiz")
+                # Set compatibility values
+                chunk["page"] = 1
+                chunk["page_heading"] = metadata.get("title") or url or "Notiz"
+                chunk["section_heading"] = None
+                chunk["token_count"] = count_tokens(chunk["text"])
+            chunking_method = "fallback"
 
         vectors = embedding_generator.embed_batch([c["text"] for c in chunks])
 
-        # Chunks mit korrekter chunk_id speichern
+        # Chunks mit korrekter chunk_id und erweiterten Metadaten speichern
         for i, (chunk, embedding) in enumerate(zip(chunks, vectors)):
             # chunk_id Format: "{doc_id}:p1:{laufende_nummer}" wenn doc_id vorhanden
             if doc_id:
                 chunk_id = f"{doc_id}:p1:{i+1}"
             else:
                 chunk_id = None
+            
+            # Calculate confidence for notes
+            confidence = 0.95  # Base confidence for manual notes
+            
+            # Bonus if heading was detected
+            if chunk.get("section_heading"):
+                confidence += 0.02
+            
+            # Bonus if chunk ends cleanly at sentence boundary
+            if chunk["text"].rstrip().endswith(('.', '!', '?', '\n')):
+                confidence += 0.01
+            
+            # Clamp confidence
+            confidence = _clamp01(confidence)
                 
-            supabase.insert_embedding(
-                text=chunk["text"],
-                metadata=chunk["metadata"],
-                embedding=embedding,
+            supabase.store_document_chunk(
                 url=url,
                 chunk_number=i,
-                chunk_id=chunk_id,  # Übergebe chunk_id
+                content=chunk["text"],
+                embedding=embedding,
+                metadata=chunk["metadata"],
+                chunk_id=chunk_id,
+                page_heading=chunk.get("page_heading"),
+                section_heading=chunk.get("section_heading"),
+                token_count=chunk.get("token_count"),
+                confidence=confidence,
             )
+
+        # Enhanced logging for notes
+        if metadata.get("is_manual"):
+            token_counts = [chunk.get("token_count", 0) for chunk in chunks]
+            if token_counts:
+                median_tokens = sorted(token_counts)[len(token_counts) // 2]
+                p90_tokens = sorted(token_counts)[int(len(token_counts) * 0.9)]
+                split_large = sum(1 for tc in token_counts if tc > 650)  # RAG_SOFT_MAX_TOKENS
+                merged_small = 0  # Would need to track from segmenter stats
+                
+                logger.info(f"Note processing complete: method={chunking_method}, "
+                           f"total_tokens={sum(token_counts)}, chunks={len(chunks)}, "
+                           f"median_tokens={median_tokens}, p90_tokens={p90_tokens}, "
+                           f"split_large={split_large}, merged_small={merged_small}")
 
         logger.info(f"Successfully processed {len(chunks)} chunks for content: {content[:50]}...")
         return {"status": "success", "doc_id": doc_id, "chunks_count": len(chunks)}

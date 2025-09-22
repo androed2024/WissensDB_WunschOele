@@ -388,3 +388,96 @@ class AgenticSegmenter:
                    f"split_large={stats['split_large']}")
         
         return all_chunks
+    
+    def segment_text(self, text: str, title: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Segment plain text (e.g., manual notes) into chunks with heading detection.
+        
+        Args:
+            text: Plain text to segment
+            title: Optional title to use as page_heading
+            
+        Returns:
+            List of chunk dictionaries with keys:
+            - text: Chunk text content
+            - page: Always 1 for plain text
+            - page_heading: Title of the note (or None)
+            - section_heading: Detected heading (or None)
+            - token_count: Number of tokens in the chunk
+        """
+        if not text or not text.strip():
+            return []
+        
+        logger.info(f"Segmenting plain text: {len(text)} characters, title='{title}'")
+        
+        # Detect headings in the text
+        headings = self._detect_headings(text)
+        
+        all_chunks = []
+        stats = {
+            "total_chunks": 0,
+            "merged_small": 0,
+            "split_large": 0
+        }
+        
+        if not headings:
+            # No headings found, treat entire text as one section
+            chunks = self._create_section_chunks(
+                text, page_num=1, page_heading=title, section_heading=None
+            )
+            all_chunks.extend(chunks)
+        else:
+            # Process sections between headings
+            current_pos = 0
+            
+            for i, (heading_pos, heading_text, pattern_type) in enumerate(headings):
+                # Add text before this heading (if any) to previous section
+                if heading_pos > current_pos:
+                    preceding_text = text[current_pos:heading_pos].strip()
+                    if preceding_text:
+                        prev_section = headings[i-1][1] if i > 0 else None
+                        section_chunks = self._create_section_chunks(
+                            preceding_text, page_num=1,
+                            page_heading=title,
+                            section_heading=prev_section
+                        )
+                        all_chunks.extend(section_chunks)
+                
+                # Determine the end of this section
+                next_heading_pos = (headings[i+1][0] if i+1 < len(headings) 
+                                  else len(text))
+                
+                # Extract section content (including the heading)
+                section_text = text[heading_pos:next_heading_pos].strip()
+                
+                if section_text:
+                    section_chunks = self._create_section_chunks(
+                        section_text, page_num=1,
+                        page_heading=title,
+                        section_heading=heading_text
+                    )
+                    all_chunks.extend(section_chunks)
+                
+                current_pos = next_heading_pos
+        
+        # Merge small chunks
+        initial_count = len(all_chunks)
+        all_chunks = self._merge_small_chunks(all_chunks)
+        stats["merged_small"] = initial_count - len(all_chunks)
+        stats["total_chunks"] = len(all_chunks)
+        
+        # Calculate statistics
+        token_counts = [chunk["token_count"] for chunk in all_chunks]
+        if token_counts:
+            stats["median_tokens"] = sorted(token_counts)[len(token_counts) // 2]
+            stats["p90_tokens"] = sorted(token_counts)[int(len(token_counts) * 0.9)]
+            stats["split_large"] = sum(1 for tc in token_counts if tc > self.soft_max_tokens)
+        
+        # Log statistics
+        logger.info(f"Plain text segmentation completed: {stats['total_chunks']} chunks")
+        logger.info(f"Statistics: median_tokens={stats.get('median_tokens', 0)}, "
+                   f"p90_tokens={stats.get('p90_tokens', 0)}, "
+                   f"merged_small={stats['merged_small']}, "
+                   f"split_large={stats['split_large']}")
+        
+        return all_chunks

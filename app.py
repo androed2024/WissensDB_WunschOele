@@ -1760,21 +1760,36 @@ async def main():
                     "🗑️ Ausgewähltes Dokument/Notiz löschen", key="delete_doc_button"
                 )
 
-            # Metadaten aus Supabase holen
+            # Metadaten und Inhalt aus Supabase holen
             try:
                 res = (
                     supabase_client.client.table("rag_pages")
-                    .select("content", "metadata")
+                    .select("content", "metadata", "chunk_number")
                     .eq("url", delete_filename)
-                    .limit(1)
+                    .order("chunk_number")  # Chunks in richtiger Reihenfolge
                     .execute()
                 )
 
                 if res.data:
-                    entry = res.data[0]
-                    content = entry.get("content", "")
-                    metadata = entry.get("metadata", {})
+                    # Für manuelle Notizen alle Chunks zusammensetzen
+                    first_entry = res.data[0]
+                    metadata = first_entry.get("metadata", {})
                     source = metadata.get("source", "")
+                    
+                    if source == "manuell" and len(res.data) > 1:
+                        # Mehrere Chunks -> zusammensetzen (agentisch gechunkte Notiz)
+                        content_parts = []
+                        for entry in res.data:
+                            chunk_content = entry.get("content", "")
+                            if chunk_content.strip():
+                                content_parts.append(chunk_content.strip())
+                        
+                        # Chunks mit Zeilentrennung zusammenfügen
+                        content = "\n\n".join(content_parts)
+                        st.info(f"📄 Lange Notiz rekonstruiert aus {len(res.data)} agentisch erzeugten Chunks")
+                    else:
+                        # Einzelner Chunk oder andere Dokumente
+                        content = first_entry.get("content", "")
 
                     if source == "manuell":
                         # Put title and source side by side
