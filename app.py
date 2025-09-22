@@ -376,104 +376,188 @@ def _chat_history_df(chat_history: List[Dict]) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     return df
 
-
 def render_chat_history():
-    """Rendert die Chat-Historie mit Suche (oben), Tabelle links und Details rechts."""
+    """Suche oben, klickbare Tabelle links (AgGrid) und Details rechts."""
 
-    # ── Daten holen ────────────────────────────────────────────────────────────────
+    # ── Suche ──────────────────────────────────────────────────────────────────────
+    top1, top2 = st.columns([4, 1])
+    with top1:
+        search_term = st.text_input(
+            "🔎 Suche in Fragen (Wildcard-Suche)",
+            value=st.session_state.get("chat_history_search", ""),
+            key="chat_history_search_input",
+        )
+    with top2:
+        st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
+        if st.button("Suchen", key="chat_history_search_btn", use_container_width=True):
+            st.session_state.chat_history_search = search_term.strip()
+            st.session_state.selected_chat_id = None
+            print("[CHAT] Search submitted → rerun")
+            st.rerun()
+
+    # ── Daten ─────────────────────────────────────────────────────────────────────
     chat_history = get_chat_history(st.session_state.get("chat_history_search", ""))
-
     if not chat_history:
-        if st.session_state.get("chat_history_search"):
-            st.info(
-                f"Keine Chats gefunden für: '{st.session_state.chat_history_search}'"
-            )
-        else:
-            st.info("Keine Chat-Historie verfügbar.")
+        st.info(
+            f"Keine Chats gefunden für: '{st.session_state.get('chat_history_search','')}'"
+            if st.session_state.get("chat_history_search")
+            else "Keine Chat-Historie verfügbar."
+        )
         return
 
-    # ── Zeile 2: Liste (links) + Details (rechts) → links 1/3, rechts 2/3 ──────────
+    chat_df = _chat_history_df(chat_history)  # id, Datum, Frage
+    grid_df = chat_df[["Datum", "Frage", "id"]].reset_index(drop=True)
+
+    # Erstinitialisierung der Auswahl
+    if not st.session_state.get("selected_chat_id") and len(grid_df) > 0:
+        st.session_state.selected_chat_id = grid_df.loc[0, "id"]
+        print(f"[CHAT] init selected_chat_id -> {st.session_state.selected_chat_id}")
+
+    # ── Layout ────────────────────────────────────────────────────────────────────
     col_list, col_detail = st.columns([1, 2])
 
-    # ── Linke Spalte: Tabelle / AgGrid ─────────────────────────────────────────────
+    # ── Hilfsfunktion: Auswahl sicher aus AgGridReturn holen ──────────────────────
+    def _get_selected_rows(grid_return) -> list[dict]:
+        try:
+            # Dict-Return (ältere Versionen)
+            if isinstance(grid_return, dict):
+                rows = grid_return.get("selected_rows") or grid_return.get("selectedRows") or []
+            else:
+                # Neuere Version: Attribute können DataFrames sein
+                rows = getattr(grid_return, "selected_rows", None)
+                if rows is None:
+                    rows = getattr(grid_return, "selectedRows", None)
+
+            # Normalisieren
+            if rows is None:
+                return []
+            import pandas as _pd
+            if isinstance(rows, _pd.DataFrame):
+                return rows.to_dict("records")
+            if isinstance(rows, list):
+                return rows
+            # Fallback: unbekannter Typ → in Liste packen, wenn Mapping
+            try:
+                return [dict(rows)]
+            except Exception:
+                return []
+        except Exception as e:
+            print(f"[CHAT] _get_selected_rows error: {e}")
+            return []
+
+    # ── Linke Spalte: Tabelle / AgGrid ────────────────────────────────────────────
     with col_list:
         st.markdown("**Chat-Liste:**")
 
-        chat_df = _chat_history_df(chat_history)  # erwartet: id, Datum, Frage
-        if "Datum" not in chat_df.columns and "Zeit" in chat_df.columns:
-            chat_df = chat_df.rename(columns={"Zeit": "Datum"})
-        grid_df = chat_df[["Datum", "Frage", "id"]].reset_index(drop=True)
-        
-        # Debug-Output für DataFrame
-        print(f"🔍 DEBUG DataFrame:")
-        print(f"   chat_history length: {len(chat_history)}")
-        print(f"   chat_df columns: {list(chat_df.columns)}")
-        print(f"   grid_df shape: {grid_df.shape}")
-        print(f"   grid_df head:\n{grid_df.head()}")
-
-        # VEREINFACHTE LÖSUNG: Verwende st.selectbox statt AgGrid für zuverlässige Selektion
-        if len(grid_df) > 0:
-            # Erstelle Labels für Selectbox
-            options = []
-            labels = []
-            for _, row in grid_df.iterrows():
-                chat_id = row['id']
-                label = f"{row['Datum']} — {row['Frage']}"
-                options.append(chat_id)
-                labels.append(label)
-            
-            # Finde aktuellen Index
-            current_id = st.session_state.get("selected_chat_id")
-            current_index = 0
-            if current_id and current_id in options:
-                current_index = options.index(current_id)
-            
-            # Debug-Output
-            print(f"🔍 DEBUG Selectbox:")
-            print(f"   Options count: {len(options)}")
-            print(f"   Current selected_chat_id: {current_id}")
-            print(f"   Current index: {current_index}")
-            
-            # Selectbox für Chat-Auswahl
-            selected_index = st.selectbox(
-                "Chat auswählen:",
-                options=range(len(options)),
-                index=current_index,
-                format_func=lambda x: labels[x] if x < len(labels) else "Unbekannt",
-                key="chat_selectbox"
+        if AGGRID:
+            from st_aggrid import GridOptionsBuilder
+            gb = GridOptionsBuilder.from_dataframe(grid_df)
+            gb.configure_column("id", hide=True)
+            gb.configure_column("Datum", headerName="Datum", width=110, resizable=True)
+            gb.configure_column("Frage", headerName="Frage", flex=1, wrapText=True, autoHeight=True)
+            gb.configure_default_column(resizable=True, sortable=True, filter=True)
+            gb.configure_selection(selection_mode="single", use_checkbox=False)
+            gb.configure_grid_options(
+                rowHeight=28,
+                suppressRowClickSelection=False,
+                animateRows=False,
+                domLayout="autoHeight",
+                rememberSelection=True,
             )
-            
-            # Prüfe ob sich Selektion geändert hat
-            if selected_index is not None and selected_index < len(options):
-                selected_id = options[selected_index]
-                print(f"   Selected ID: {selected_id}")
-                
-                if selected_id != current_id:
-                    print(f"   ✅ Neue Auswahl: {selected_id}")
-                    st.session_state.selected_chat_id = selected_id
+
+            grid_key = f"chat_history_grid_v5_{len(grid_df)}_{st.session_state.get('chat_history_search','').strip()}"
+
+            # Neu: update_on (neue API)  → Fallback: update_mode (alte API)
+            try:
+                grid = AgGrid(
+                    grid_df,
+                    gridOptions=gb.build(),
+                    update_on=["selectionChanged"],     # <- wichtig
+                    fit_columns_on_grid_load=True,
+                    allow_unsafe_jscode=True,
+                    enable_enterprise_modules=False,
+                    theme="alpine",
+                    key=grid_key,
+                )
+            except TypeError:
+                from st_aggrid import GridUpdateMode
+                grid = AgGrid(
+                    grid_df,
+                    gridOptions=gb.build(),
+                    update_mode=GridUpdateMode.SELECTION_CHANGED,
+                    fit_columns_on_grid_load=True,
+                    allow_unsafe_jscode=True,
+                    enable_enterprise_modules=False,
+                    theme="alpine",
+                    key=grid_key,
+                )
+
+            print(f"[CHAT] grid type: {type(grid)}")
+            selected_rows = _get_selected_rows(grid)
+            print(f"[CHAT] selected_rows len = {len(selected_rows)}")
+
+            if selected_rows:
+                row0 = selected_rows[0]
+                print(f"[CHAT] first selected row keys: {list(row0.keys())}")
+                sel_id = row0.get("id")
+
+                # Falls 'id' durch Hide nicht mitkommt → anhand Datum/Frage rekonstruieren
+                if not sel_id:
+                    try:
+                        match = grid_df[
+                            (grid_df["Datum"] == row0.get("Datum")) &
+                            (grid_df["Frage"] == row0.get("Frage"))
+                        ]
+                        if len(match) == 1:
+                            sel_id = match.iloc[0]["id"]
+                            print(f"[CHAT] reconstructed id -> {sel_id}")
+                    except Exception as e:
+                        print(f"[CHAT] reconstruct failed: {e}")
+
+                if sel_id and sel_id != st.session_state.get("selected_chat_id"):
+                    st.session_state.selected_chat_id = sel_id
+                    print(f"[CHAT] >> selection changed -> {sel_id} (rerun)")
                     st.rerun()
                 else:
-                    print(f"   ⚪ Keine Änderung")
-        else:
-            st.info("Keine Chat-Einträge verfügbar.")
+                    print("[CHAT] selection unchanged or id missing")
 
-    # ── Rechte Spalte: Chat-Details ────────────────────────────────────────────────
+            # Kompakteres Grid CSS
+            st.markdown(
+                """
+                <style>
+                .ag-theme-alpine .ag-cell { padding: 2px 4px !important; font-size: 12px !important; line-height: 1.2 !important; }
+                .ag-theme-alpine .ag-header-cell-label { padding: 2px 4px !important; font-size: 12px !important; font-weight: 600 !important; }
+                .ag-theme-alpine .ag-row { min-height: 28px !important; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            # Fallback ohne AgGrid
+            options = grid_df["id"].tolist()
+            labels = [f"{row['Datum']} — {row['Frage']}" for _, row in grid_df.iterrows()]
+            current = st.session_state.get("selected_chat_id")
+            idx = options.index(current) if current in options else 0 if options else None
+            if options:
+                selection = st.radio(" ", options=options, index=idx,
+                                     format_func=lambda x: labels[options.index(x)])
+                if selection and selection != current:
+                    st.session_state.selected_chat_id = selection
+                    print(f"[CHAT] radio -> selection changed to {selection} (rerun)")
+                    st.rerun()
+            else:
+                st.info("Keine Einträge.")
+
+    # ── Rechte Spalte: Chat-Details ───────────────────────────────────────────────
     with col_detail:
         st.markdown("**Chat-Details:**")
         sel_id = st.session_state.get("selected_chat_id")
-        
-        # Debug-Output für Chat-Details
-        print(f"🔍 DEBUG Chat Details:")
-        print(f"   sel_id from session_state: {sel_id}")
-        print(f"   Available chat_history IDs: {[c.get('id') for c in chat_history[:3]]}")  # Nur erste 3 für Übersicht
-        
+        print(f"[CHAT] details sel_id = {sel_id}")
+
         if sel_id:
-            selected_chat = next(
-                (c for c in chat_history if c.get("id") == sel_id), None
-            )
-            print(f"   Found selected_chat: {selected_chat is not None}")
+            selected_chat = next((c for c in chat_history if c.get("id") == sel_id), None)
+            print(f"[CHAT] found selected_chat? -> {bool(selected_chat)}")
             if selected_chat:
-                print(f"   Question preview: {selected_chat.get('question', '')[:50]}...")
                 with st.chat_message("user"):
                     st.markdown(selected_chat.get("question", ""))
                 with st.chat_message("assistant"):
@@ -482,6 +566,7 @@ def render_chat_history():
                 st.info("Chat nicht gefunden.")
         else:
             st.info("Wähle links einen Eintrag aus, um Frage & Antwort zu sehen.")
+
 
 
 async def update_available_sources():
