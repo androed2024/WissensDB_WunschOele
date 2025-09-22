@@ -68,6 +68,56 @@ class DocumentIngestionPipeline:
             if not processor:
                 logger.error(f"Unsupported file type: {file_path}")
                 return []
+
+            # Metadaten EINMAL holen
+            try:
+                processor_metadata = processor.get_metadata(file_path)
+            except Exception:
+                processor_metadata = {}
+
+            base_meta = (metadata or {}).copy()
+            title_guess = os.path.splitext(os.path.basename(file_path))[0]
+
+            doc_title = base_meta.get("title") or processor_metadata.get("pdf_title") or title_guess
+
+            # Zeitkandidaten (ISO Strings)
+            pdf_created  = processor_metadata.get("pdf_creation_date")
+            pdf_modified = processor_metadata.get("pdf_mod_date")
+            fs_ctime     = processor_metadata.get("fs_ctime")
+            fs_mtime     = processor_metadata.get("fs_mtime")
+
+            # Basis doc_row für bestehende Schema-Kompatibilität
+            doc_row = {
+                "title": doc_title,
+                "source_url": base_meta.get("source_url") or base_meta.get("original_filename") or os.path.basename(file_path),
+                "doc_type": base_meta.get("doc_type") or processor_metadata.get("content_type") or "application/octet-stream",
+            }
+
+            # Versuche erweiterte Felder hinzuzufügen (falls Schema aktualisiert)
+            try:
+                doc_row.update({
+                    "file_created_at": pdf_created or fs_ctime,
+                    "file_modified_at": pdf_modified or fs_mtime,
+                    "file_hash": base_meta.get("file_hash"),
+                })
+                # Versuche Upsert mit neuen Spalten
+                on_conflict_cols = "file_hash" if doc_row.get("file_hash") else "source_url,file_created_at"
+                doc_resp = self.supabase_client.client.table("document_metadata").upsert(doc_row, on_conflict=on_conflict_cols).execute()
+                doc_id = doc_resp.data[0]["doc_id"]
+                logger.info("Doc row (upsert) → title=%s | created(file)=%s | modified(file)=%s | on_conflict=%s",
+                            doc_row["title"], doc_row.get("file_created_at"), doc_row.get("file_modified_at"), on_conflict_cols)
+            except Exception as schema_error:
+                # Fallback: Nutze alte Insert-Methode ohne neue Spalten
+                logger.warning(f"New schema not available, using fallback insert: {schema_error}")
+                doc_row_basic = {
+                    "title": doc_title,
+                    "source_url": base_meta.get("source_url") or base_meta.get("original_filename") or os.path.basename(file_path),
+                    "doc_type": base_meta.get("doc_type") or processor_metadata.get("content_type") or "application/octet-stream",
+                }
+                doc_insert = self.supabase_client.client.table("document_metadata").insert(doc_row_basic).execute()
+                doc_id = doc_insert.data[0]["doc_id"]
+                logger.info("Doc row (insert fallback) → title=%s", doc_row_basic["title"])
+
         except Exception as e:
             logger.error(f"Error getting document processor: {str(e)}")
             return []
@@ -85,10 +135,15 @@ class DocumentIngestionPipeline:
             file_extension = os.path.splitext(file_path)[1].lower()
             
             if file_extension == '.pdf':
-                # For PDFs: Combine all text elements and re-chunk with consistent parameters
-                combined_text = "\n\n".join(raw_content)
-                chunks = self.chunker.chunk_text(combined_text)
-                logger.info(f"PDF re-chunked into {len(chunks)} chunks using chunk_size={self.chunker.chunk_size}, chunk_overlap={self.chunker.chunk_overlap}")
+                # Statt alles zusammen → pro Seite chunken, damit page-Infos erhalten bleiben
+                chunks = []
+                for page_idx, page_text in enumerate(raw_content, start=1):
+                    page_chunks = self.chunker.chunk_text(page_text)
+                    # page-Nummer an jeden Chunk hängen
+                    for ch in page_chunks:
+                        ch["page"] = page_idx
+                    chunks.extend(page_chunks)
+                logger.info(f"PDF per-page chunked into {len(chunks)} chunks (keine Seiteninfos verloren)")
             elif file_extension == '.txt':
                 # For TXT files: Use processor output directly (already chunked)
                 chunks = raw_content
@@ -176,16 +231,16 @@ class DocumentIngestionPipeline:
 
         # P3: Database Insert Phase
         try:
-            document_id = str(uuid.uuid4())
+
             timestamp = datetime.now().isoformat()
             metadata = metadata.copy() if metadata else {}
             metadata.update(
                 {
                     "filename": os.path.basename(file_path),
-                    "original_filename": metadata.get("original_filename"),  # ✅ NEW
-                    "signed_url": metadata.get("signed_url"),  # ✅ NEW
+                    "original_filename": metadata.get("original_filename"),
+                    "signed_url": metadata.get("signed_url"),
                     "file_path": file_path,
-                    "file_extension": os.path.splitext(file_path)[1].lower(),  # ✅ NEW
+                    "file_extension": os.path.splitext(file_path)[1].lower(),
                     "file_size_bytes": os.path.getsize(file_path),
                     "processed_at": timestamp,
                     "chunk_count": len(chunks),
@@ -194,32 +249,59 @@ class DocumentIngestionPipeline:
 
             if on_phase:
                 on_phase("db", 0, len(chunks))
-                
-            stored_records = []
-            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                chunk_metadata = metadata.copy()
-                page = chunk.get("page")
-                if page is None:
-                    chunk_metadata["page"] = 1  # fallback for .txt-Dateien
-                else:
-                    chunk_metadata["page"] = page
 
-                try:
-                    stored_record = self.supabase_client.store_document_chunk(
-                        url=metadata.get("original_filename"),
-                        chunk_number=i,
-                        content=chunk_texts[i],
-                        embedding=embedding,
-                        metadata=chunk_metadata,
-                    )
-                    stored_records.append(stored_record)
-                    
-                    # Progress update every 10 chunks or at the end
-                    if on_phase and (i % 10 == 0 or i == len(chunks) - 1):
-                        on_phase("db", i + 1, len(chunks))
-                        
-                except Exception as e:
-                    logger.error(f"Error storing chunk {i}: {str(e)}")
+            stored_records = []
+
+            # Confidence-Basis je nach Parser
+            processor_name = (processor_metadata.get("processor") or "").lower()
+            if "pypdf2" in processor_name:
+                base_conf = 0.98
+            elif "unstructured-ocr" in processor_name:
+                base_conf = 0.85
+            else:
+                base_conf = 0.95
+
+            # Einmalige Schleife: pro Chunk genau EIN Insert
+            for i, (chunk, embedding, chunk_text) in enumerate(zip(chunks, embeddings, chunk_texts)):
+                # page bestimmen (TXT hat evtl. keine page-Info)
+                page = chunk.get("page") or 1
+
+                # token_count (Proxy) – tiktoken kannst du später ergänzen
+                token_count = len(chunk_text.split())
+
+                # confidence aktuell parserbasiert
+                confidence = base_conf
+
+                # chunk_id: doc_id + page + laufende Nummer
+                chunk_id = f"{doc_id}:p{page}:{i+1}"
+
+                # Chunk-Metadaten aufbauen
+                chunk_metadata = metadata.copy()
+                chunk_metadata["page"] = page
+                if "section_heading" in chunk:
+                    chunk_metadata["section_heading"] = chunk["section_heading"]
+                if "page_heading" in chunk:
+                    chunk_metadata["page_heading"] = chunk["page_heading"]
+
+                # EIN Insert mit allen neuen Spalten
+                stored_record = self.supabase_client.store_document_chunk(
+                    url=metadata.get("original_filename"),
+                    chunk_number=i,
+                    content=chunk_text,
+                    embedding=embedding,
+                    metadata=chunk_metadata,
+                    # ⇩ neue Spalten
+                    chunk_id=chunk_id,
+                    page_heading=chunk.get("page_heading"),
+                    section_heading=chunk.get("section_heading"),
+                    token_count=token_count,
+                    confidence=confidence,
+                )
+                stored_records.append(stored_record)
+
+                # Progress update alle 10 Chunks oder am Ende
+                if on_phase and ((i % 10 == 0) or (i == len(chunks) - 1)):
+                    on_phase("db", i + 1, len(chunks))
 
             logger.info(f"Stored {len(stored_records)} chunks in database")
             return stored_records
@@ -227,6 +309,7 @@ class DocumentIngestionPipeline:
         except Exception as e:
             logger.error(f"Error creating document records: {str(e)}")
             return []
+
 
     def process_text(
         self, content: str, metadata: dict, url: Optional[str] = None

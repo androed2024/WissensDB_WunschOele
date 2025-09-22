@@ -7,6 +7,9 @@ import logging
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 import PyPDF2
+from datetime import datetime, timezone, timedelta
+import re
+
 
 # processors.py
 from unstructured.partition.pdf import partition_pdf
@@ -17,6 +20,10 @@ from document_processing.chunker import TextChunker
 # Set up logging
 logger = logging.getLogger(__name__)
 
+_PDF_DATE_RE = re.compile(
+    r"^D:(?P<Y>\d{4})(?P<m>\d{2})?(?P<d>\d{2})?(?P<H>\d{2})?(?P<M>\d{2})?(?P<S>\d{2})?"
+    r"(?P<tz>Z|[+\-]\d{2}'?\d{2}')?$"
+)
 
 class DocumentProcessor:
     """
@@ -118,32 +125,13 @@ class TxtProcessor(DocumentProcessor):
         logger.info(f"Extracted and chunked text into {len(chunks)} chunks from {path.name}")
         return chunks
 
+
     def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        """
-        Get metadata for a TXT file.
+        md = super().get_metadata(file_path)
+        md["content_type"] = "text/plain"
+        md["processor"] = "TxtProcessor"
+        return md
 
-        Args:
-            file_path: Path to the TXT file
-
-        Returns:
-            Dictionary containing document metadata
-        """
-        metadata = super().get_metadata(file_path)
-        metadata["content_type"] = "text/plain"
-        metadata["processor"] = "TxtProcessor"
-
-        # Count lines and words from chunks
-        try:
-            chunks = self.extract_text(file_path)
-            full_text = " ".join([chunk["text"] for chunk in chunks])
-            metadata["line_count"] = len(full_text.splitlines())
-            metadata["word_count"] = len(full_text.split())
-            metadata["chunk_count"] = len(chunks)
-        except Exception:
-            # Don't fail metadata collection if text extraction fails
-            pass
-
-        return metadata
 
 
 class PdfProcessor(DocumentProcessor):
@@ -291,16 +279,115 @@ class PdfProcessor(DocumentProcessor):
         return text_elements
 
     def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        metadata = super().get_metadata(file_path)
-        metadata["content_type"] = "application/pdf"
-        
-        # Determine which processor method was/would be used
-        if self._has_extractable_text(file_path):
-            metadata["processor"] = "PdfProcessor(PyPDF2-fast)"
-        else:
-            metadata["processor"] = "PdfProcessor(unstructured-OCR)"
-            
-        return metadata
+        """
+        Robuste PDF-Metadaten:
+        - pdf_title / pdf_author aus /Info bzw. XMP
+        - pdf_creation_date / pdf_mod_date (ISO-8601)
+        - fs_ctime / fs_mtime (ISO) als Fallback
+        - processor = PdfProcessor(PyPDF2-fast) oder PdfProcessor(unstructured-OCR)
+        """
+        def _as_iso(dt: datetime | None) -> str | None:
+            if not dt:
+                return None
+            try:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+            return dt.isoformat()
+
+        def _parse_any_date(val) -> datetime | None:
+            if val is None:
+                return None
+            if isinstance(val, datetime):
+                return val
+            s = str(val).strip()
+            if not s:
+                return None
+            if s.startswith("D:"):
+                try:
+                    # nutzt das globale _PDF_DATE_RE
+                    s2 = s.replace(" ", "")
+                    m = _PDF_DATE_RE.match(s2)
+                    if m:
+                        vals = m.groupdict()
+                        Y = int(vals["Y"]); mo = int(vals["m"] or 1); d = int(vals["d"] or 1)
+                        H = int(vals["H"] or 0); M = int(vals["M"] or 0); S = int(vals["S"] or 0)
+                        tzs = vals["tz"]; tzinfo = timezone.utc
+                        if tzs and tzs != "Z":
+                            sign = 1 if tzs[0] == "+" else -1
+                            hh = int(tzs[1:3]); mm = int(tzs[4:6]) if len(tzs) >= 6 else 0
+                            tzinfo = timezone(sign * timedelta(hours=hh, minutes=mm))
+                        return datetime(Y, mo, d, H, M, S, tzinfo=tzinfo)
+                except Exception:
+                    pass
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+
+        md: Dict[str, Any] = {"content_type": "application/pdf"}
+        md["processor"] = (
+            "PdfProcessor(PyPDF2-fast)" if self._has_extractable_text(file_path) else "PdfProcessor(unstructured-OCR)"
+        )
+
+        try:
+            reader = PyPDF2.PdfReader(file_path)
+            info = getattr(reader, "metadata", None) or getattr(reader, "documentInfo", None) or {}
+
+            if hasattr(info, "get"):
+                title  = info.get("/Title",  None)
+                author = info.get("/Author", None)
+                cdate  = info.get("/CreationDate", None)
+                mdate  = info.get("/ModDate",      None)
+            else:
+                title  = getattr(info, "title", None)
+                author = getattr(info, "author", None)
+                cdate  = getattr(info, "creation_date", None)
+                mdate  = getattr(info, "mod_date", None) or getattr(info, "modification_date", None)
+
+            # XMP ergänzend
+            try:
+                xmp = getattr(reader, "xmp_metadata", None)
+                if xmp:
+                    xmp_created  = getattr(xmp, "xmp_createDate", None) or getattr(xmp, "createDate", None)
+                    xmp_modified = getattr(xmp, "xmp_modifyDate", None) or getattr(xmp, "modifyDate", None)
+                    if not cdate and xmp_created:
+                        cdate = xmp_created
+                    if not mdate and xmp_modified:
+                        mdate = xmp_modified
+                    if not title:
+                        title = getattr(xmp, "dc_title", None) or getattr(xmp, "title", None)
+                    if not author:
+                        author = getattr(xmp, "dc_creator", None) or getattr(xmp, "creator", None)
+            except Exception:
+                pass
+
+            pdf_created_dt  = _parse_any_date(cdate)
+            pdf_modified_dt = _parse_any_date(mdate)
+
+            md.update({
+                "pdf_title": title or None,
+                "pdf_author": author or None,
+                "pdf_creation_date": _as_iso(pdf_created_dt),
+                "pdf_mod_date": _as_iso(pdf_modified_dt),
+            })
+        except Exception as e:
+            logger.warning(f"PDF metadata read failed: {e}")
+
+        try:
+            st = os.stat(file_path)
+            md["fs_ctime"] = datetime.fromtimestamp(st.st_ctime, tz=timezone.utc).isoformat()
+            md["fs_mtime"] = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+        except Exception as e:
+            logger.warning(f"FS times read failed: {e}")
+
+        logger.info(
+            "PDF meta → title=%s, created(pdf)=%s, modified(pdf)=%s, fs_ctime=%s, fs_mtime=%s",
+            md.get("pdf_title"), md.get("pdf_creation_date"), md.get("pdf_mod_date"),
+            md.get("fs_ctime"), md.get("fs_mtime")
+        )
+        return md
 
 
 def get_document_processor(file_path: str, chunker: Optional[TextChunker] = None) -> Optional[DocumentProcessor]:

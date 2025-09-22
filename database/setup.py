@@ -79,17 +79,12 @@ class SupabaseClient:
             print(f"❌ Fehler beim Einfügen des Embeddings: {e}")
             raise e
 
+    # database/setup.py (oder wo deine SupabaseClient-Klasse definiert ist)
     def store_document_chunk(
-        self,
-        url: str,
-        chunk_number: int,
-        content: str,
-        embedding: List[float],
-        metadata: Dict[str, Any] = None,
-    ) -> Dict[str, Any]:
-        if metadata is None:
-            metadata = {}
-
+        self, url, chunk_number, content, embedding, metadata,
+        chunk_id=None, page_heading=None, section_heading=None,
+        token_count=None, confidence=None,
+    ):
         data = {
             "url": url,
             "chunk_number": chunk_number,
@@ -97,9 +92,22 @@ class SupabaseClient:
             "embedding": embedding,
             "metadata": metadata,
         }
+        if chunk_id is not None:
+            data["chunk_id"] = chunk_id
+        if page_heading is not None:
+            data["page_heading"] = page_heading
+        if section_heading is not None:
+            data["section_heading"] = section_heading
+        if token_count is not None:
+            data["token_count"] = token_count
+        if confidence is not None:
+            data["confidence"] = confidence
 
-        result = self.client.table("rag_pages").insert(data).execute()
-        return result.data[0] if result.data else {}
+        resp = self.client.table("rag_pages").insert(data).execute()
+        # <- WICHTIG: Dict statt APIResponse zurückgeben
+        return resp.data[0] if getattr(resp, "data", None) else data
+
+
 
     def search_documents(
         self,
