@@ -1114,40 +1114,34 @@ async def main():
                 "Du kannst hier eigene Notizen, Feedback oder Empfehlungen eintragen, die sofort durchsuchbar sind."
             )
 
-            # Initialisierung der Eingabefelder in session_state
-            for key in ["manual_title", "manual_text", "manual_source"]:
-                if key not in st.session_state:
-                    st.session_state[key] = ""
-
-            # Initialisierung für Erfolgs-/Fehlermeldungen
+            # Initialisierung für Erfolgs-/Fehlermeldungen und Reset-Counter
             if "note_save_message" not in st.session_state:
                 st.session_state.note_save_message = ""
+            if "input_reset_counter" not in st.session_state:
+                st.session_state.input_reset_counter = 0
 
-            # Eingabefelder mit session_state
+            # Eingabefelder mit dynamischen Keys für Reset-Funktionalität
+            reset_suffix = st.session_state.input_reset_counter
             manual_title = st.text_input(
                 "🏷️ Überschrift",
-                key="manual_title_input",
+                key=f"manual_title_input_{reset_suffix}",
             )
-            manual_text = st.text_area("✍️ Dein Wissen", key="manual_text_input")
+            manual_text = st.text_area(
+                "✍️ Dein Wissen", 
+                key=f"manual_text_input_{reset_suffix}"
+            )
 
             # Handle manuelle Quelle sicher
             source_options = ["Wissen", "Beratung", "Meeting", "Feedback", "Sonstiges"]
-            try:
-                source_index = source_options.index(st.session_state.manual_source)
-            except ValueError:
-                source_index = 0
-
             source_type = st.selectbox(
                 "Kategorie",
                 source_options,
-                index=source_index,
-                key="manual_source_input",
+                index=1,  # Default zu "Beratung"
+                key=f"manual_source_input_{reset_suffix}",
             )
 
-            # Button-Reihe nebeneinander mit Columns
-            col1, col2, col3 = st.columns([2, 1, 4])
-            with col1:
-                if st.button("✅ Wissen / Notiz speichern", key="save_button"):
+            # Speichern-Button
+            if st.button("✅ Wissen / Notiz speichern", key="save_button"):
                     # Clear any previous messages
                     st.session_state.note_save_message = ""
 
@@ -1245,6 +1239,7 @@ async def main():
                                         "source_filter": "privatedocs",  # Storage verfügbar
                                         "storage_filename": note_filename,
                                         "has_storage_file": True,
+                                        "is_manual": True,  # Flag für manuelle Notizen
                                     }
                                 else:
                                     metadata = {
@@ -1255,36 +1250,30 @@ async def main():
                                         "original_filename": manual_title.strip(),  # Fallback: Nur Titel
                                         "source_filter": "notes",  # Kein Storage verfügbar
                                         "has_storage_file": False,
+                                        "is_manual": True,  # Flag für manuelle Notizen
                                     }
                                 result = pipeline.process_text(
                                     content=manual_text,
                                     metadata=metadata,
                                     url=manual_title.strip(),
                                 )
-                                # Set success message instead of toast
-                                st.session_state.note_save_message = (
-                                    "✅ Wissen/Notizen erfolgreich gespeichert"
-                                )
+                                # Set success message based on result
+                                if result and result.get("status") == "duplicate":
+                                    st.session_state.note_save_message = (
+                                        "ℹ️ Identische Notiz bereits vorhanden - nicht erneut gespeichert"
+                                    )
+                                else:
+                                    st.session_state.note_save_message = (
+                                        "✅ Wissen/Notizen erfolgreich gespeichert"
+                                    )
                                 await update_available_sources()
-                                st.session_state.manual_title = ""
-                                st.session_state.manual_text = ""
-                                st.session_state.manual_source = "Beratung"
+                                # Lösche Input-Felder nach erfolgreichem Speichern
+                                st.session_state.input_reset_counter += 1
                                 st.rerun()
                             except Exception as e:
                                 # Set error message instead of direct error display
                                 st.session_state.note_save_message = f"❌ Fehler beim Speichern des Wissens/der Notiz: {e}"
 
-            with col2:
-                if st.button("🧹 Eingaben leeren", key="clear_button"):
-                    st.session_state.manual_title = ""
-                    st.session_state.manual_text = ""
-                    st.session_state.manual_source = "Beratung"
-                    st.session_state.note_save_message = ""  # Clear success message
-                    st.rerun()
-
-            with col3:
-                # Leere Spalte für Abstand
-                pass
 
             # Display success/error message below buttons
             if st.session_state.note_save_message:

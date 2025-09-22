@@ -313,13 +313,19 @@ class DocumentIngestionPipeline:
 
     def process_text(
         self, content: str, metadata: dict, url: Optional[str] = None
-    ) -> List[dict]:
+    ) -> dict:
         """
         Verarbeitet manuellen Text und speichert ihn samt Embeddings in Supabase.
+        Implementiert Duplikatsprüfung für manuelle Notizen.
+        
+        Returns:
+            dict: Status-Information mit 'status' key ('success' oder 'duplicate')
         """
+        import hashlib
         from document_processing.chunker import TextChunker
         from document_processing.embeddings import EmbeddingGenerator
         from database.setup import SupabaseClient
+        from datetime import datetime, timezone
 
         # Use environment variables for consistent chunking
         chunk_size = int(os.getenv('CHUNK_SIZE', 1000))
@@ -328,58 +334,115 @@ class DocumentIngestionPipeline:
         embedding_generator = EmbeddingGenerator()
         supabase = SupabaseClient()
 
-        # --- NEW: document_metadata-Eintrag für manuelle Notizen ---
-        # Annahmen: metadata enthält von der App:
-        #  - "title": Titel der Notiz
-        #  - "quelle": Kategorie ("Wissen", "Beratung", ...)
-        #  - optional "original_filename" / "storage_filename" wenn in Storage geschrieben
-        from datetime import datetime, timezone
+        # Duplikatsprüfung und document_metadata Insert nur für manuelle Notizen
+        doc_id = None
+        note_hash = None
+        has_schema_support = False
+        
+        if metadata.get("is_manual"):
+            manual_title = (metadata.get("title") or (url or "Notiz")).strip()
+            category = (metadata.get("quelle") or "Notiz").lower()
+            content_trimmed = content.strip()
+            
+            # Hash berechnen: SHA-256 über "{title}\n{content}\n{category}"
+            hash_input = f"{manual_title}\n{content_trimmed}\n{category}"
+            note_hash = hashlib.sha256(hash_input.encode('utf-8')).hexdigest()
+            
+            # Prüfe zuerst ob die neue Schema-Unterstützung vorhanden ist
+            try:
+                # Test-Query um zu prüfen ob file_hash Spalte existiert
+                test_result = supabase.client.table("document_metadata").select("file_hash").limit(1).execute()
+                has_schema_support = True
+                logger.info("Schema supports file_hash - deduplication enabled")
+            except Exception as e:
+                has_schema_support = False
+                logger.info(f"Schema doesn't support file_hash - deduplication disabled: {e}")
+            
+            # Duplikatsuche nur wenn Schema-Unterstützung vorhanden
+            if has_schema_support:
+                try:
+                    existing = supabase.client.table("document_metadata").select("doc_id").eq(
+                        "file_hash", note_hash
+                    ).eq("title", manual_title).eq("doc_type", metadata.get("quelle", "Notiz")).execute()
+                    
+                    if existing.data:
+                        logger.info(f"Duplicate manual note found for hash {note_hash[:8]}...")
+                        return {"status": "duplicate", "hash": note_hash}
+                except Exception as e:
+                    logger.warning(f"Error checking for duplicates: {e}")
+            
+            # document_metadata Eintrag vorbereiten
+            now_utc = datetime.now(timezone.utc)
+            source_url = (
+                metadata.get("storage_filename")
+                or metadata.get("original_filename")
+                or (url or manual_title)
+            )
+            
+            if has_schema_support:
+                # Mit neuen Spalten
+                doc_row = {
+                    "title": manual_title,
+                    "source_url": source_url,
+                    "doc_type": metadata.get("quelle", "Notiz"),
+                    "created_at": now_utc.isoformat(),
+                    "file_created_at": now_utc.isoformat(),
+                    "file_modified_at": now_utc.isoformat(),
+                    "file_hash": note_hash,
+                    "extra": {
+                        "is_manual": True,
+                        "category": metadata.get("quelle", "Notiz"),
+                    },
+                }
+            else:
+                # Fallback ohne neue Spalten
+                doc_row = {
+                    "title": manual_title,
+                    "source_url": source_url,
+                    "doc_type": metadata.get("quelle", "Notiz"),
+                    "extra": {
+                        "is_manual": True,
+                        "category": metadata.get("quelle", "Notiz"),
+                    },
+                }
+            
+            # Versuche document_metadata Insert
+            try:
+                doc_ins = supabase.client.table("document_metadata").insert(doc_row).execute()
+                doc_id = doc_ins.data[0]["doc_id"]
+                logger.info(f"Inserted manual note into document_metadata: doc_id={doc_id}, has_schema={has_schema_support}")
+            except Exception as e:
+                logger.warning(f"Failed to insert manual note into document_metadata: {e}")
+                # WICHTIG: Nicht abbrechen - Chunks trotzdem speichern!
 
-        manual_title = (metadata.get("title") or (url or "Notiz")).strip()
-        category = metadata.get("quelle") or "Notiz"
-
-        # Quelle/URL robust bestimmen (nie NULL)
-        source_url = (
-            metadata.get("storage_filename")
-            or metadata.get("original_filename")
-            or (url or manual_title)
-        )
-
-        doc_row = {
-            "title": manual_title,
-            "source_url": source_url,
-            "doc_type": category,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "extra": {
-                "is_manual": True,
-                "category": category,
-            },
-        }
-
-        try:
-            # Upsert optional: wenn du Duplikate pro (source_url, created_at) verhindern willst,
-            # kannst du `on_conflict="source_url,created_at"` verwenden – falls es dafür
-            # einen UNIQUE-Index gibt. Ohne UNIQUE bitte einfach .insert().
-            doc_ins = supabase.client.table("document_metadata").insert(doc_row).execute()
-            # Wenn du die doc_id für chunk_id o.Ä. brauchst:
-            # doc_id = doc_ins.data[0]["doc_id"]
-        except Exception as e:
-            logger.error(f"failed to insert manual note into document_metadata: {e}")
-        # --- END NEW ---
-
+        # Chunking und Embedding - IMMER ausführen, auch wenn document_metadata fehlschlägt
         chunks = chunker.chunk_text(content)
         for chunk in chunks:
-            chunk["metadata"] = metadata
+            chunk["metadata"] = metadata.copy()
+            # Erweitere Chunk-Metadaten für manuelle Notizen
+            if metadata.get("is_manual") and note_hash:
+                chunk["metadata"]["is_manual"] = True
+                chunk["metadata"]["note_hash"] = note_hash
+                chunk["metadata"]["category"] = metadata.get("quelle", "Notiz")
 
         vectors = embedding_generator.embed_batch([c["text"] for c in chunks])
 
+        # Chunks mit korrekter chunk_id speichern
         for i, (chunk, embedding) in enumerate(zip(chunks, vectors)):
+            # chunk_id Format: "{doc_id}:p1:{laufende_nummer}" wenn doc_id vorhanden
+            if doc_id:
+                chunk_id = f"{doc_id}:p1:{i+1}"
+            else:
+                chunk_id = None
+                
             supabase.insert_embedding(
                 text=chunk["text"],
                 metadata=chunk["metadata"],
                 embedding=embedding,
                 url=url,
-                chunk_number=i,  # ✅ Index mitgeben
+                chunk_number=i,
+                chunk_id=chunk_id,  # Übergebe chunk_id
             )
 
-        return chunks
+        logger.info(f"Successfully processed {len(chunks)} chunks for content: {content[:50]}...")
+        return {"status": "success", "doc_id": doc_id, "chunks_count": len(chunks)}

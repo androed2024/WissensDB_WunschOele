@@ -57,6 +57,7 @@ class SupabaseClient:
         embedding: list,
         url: Optional[str] = None,
         chunk_number: int = 0,
+        chunk_id: Optional[str] = None,
     ):
         """
         Speichert einen einzelnen Chunk mit Text, Metadaten und Vektor in die Tabelle 'rag_pages'.
@@ -71,6 +72,9 @@ class SupabaseClient:
 
         if url:
             row["url"] = url
+        
+        if chunk_id:
+            row["chunk_id"] = chunk_id
 
         try:
             response = self.client.table("rag_pages").insert(row).execute()
