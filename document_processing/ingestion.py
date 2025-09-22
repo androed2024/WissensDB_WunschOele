@@ -17,6 +17,7 @@ from math import ceil
 from document_processing.chunker import TextChunker
 from document_processing.embeddings import EmbeddingGenerator
 from document_processing.processors import get_document_processor
+from document_processing.segmenter import AgenticSegmenter
 from database.setup import SupabaseClient
 
 # Set up logging
@@ -26,6 +27,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _clamp01(value: float) -> float:
+    """
+    Clamp a value to the range [0, 1] to ensure database constraints are met.
+    
+    Args:
+        value: Value to clamp
+        
+    Returns:
+        Clamped value between 0.0 and 1.0
+    """
+    return max(0.0, min(1.0, float(value)))
+
+
 class DocumentIngestionPipeline:
     def __init__(self, supabase_client: Optional[SupabaseClient] = None):
         # Load chunk parameters from environment variables
@@ -33,10 +47,13 @@ class DocumentIngestionPipeline:
         chunk_overlap = int(os.getenv('CHUNK_OVERLAP', 200))
         
         self.chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        self.segmenter = AgenticSegmenter()  # Uses environment variables for token limits
         self.embedding_generator = EmbeddingGenerator()
         self.max_file_size_mb = 10
         self.supabase_client = supabase_client or SupabaseClient()
         logger.info(f"Initialized DocumentIngestionPipeline with chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+        logger.info(f"AgenticSegmenter configured with max_tokens={self.segmenter.max_tokens}, "
+                   f"soft_max={self.segmenter.soft_max_tokens}, min_tokens={self.segmenter.min_tokens}")
 
     def _check_file(self, file_path: str) -> bool:
         print("🔎 Checking file:", file_path)
@@ -100,12 +117,31 @@ class DocumentIngestionPipeline:
                     "file_modified_at": pdf_modified or fs_mtime,
                     "file_hash": base_meta.get("file_hash"),
                 })
-                # Versuche Upsert mit neuen Spalten
-                on_conflict_cols = "file_hash" if doc_row.get("file_hash") else "source_url,file_created_at"
-                doc_resp = self.supabase_client.client.table("document_metadata").upsert(doc_row, on_conflict=on_conflict_cols).execute()
-                doc_id = doc_resp.data[0]["doc_id"]
-                logger.info("Doc row (upsert) → title=%s | created(file)=%s | modified(file)=%s | on_conflict=%s",
-                            doc_row["title"], doc_row.get("file_created_at"), doc_row.get("file_modified_at"), on_conflict_cols)
+                # Versuche Upsert mit neuen Spalten - first try without on_conflict
+                try:
+                    # Try simple insert first
+                    doc_resp = self.supabase_client.client.table("document_metadata").insert(doc_row).execute()
+                    doc_id = doc_resp.data[0]["doc_id"]
+                    logger.info("Doc row (insert) → title=%s | created(file)=%s | modified(file)=%s",
+                               doc_row["title"], doc_row.get("file_created_at"), doc_row.get("file_modified_at"))
+                except Exception as insert_error:
+                    # If insert fails, try upsert with appropriate on_conflict
+                    try:
+                        on_conflict_cols = "file_hash" if doc_row.get("file_hash") else "source_url"
+                        doc_resp = self.supabase_client.client.table("document_metadata").upsert(doc_row, on_conflict=on_conflict_cols).execute()
+                        doc_id = doc_resp.data[0]["doc_id"]
+                        logger.info("Doc row (upsert) → title=%s | on_conflict=%s",
+                                   doc_row["title"], on_conflict_cols)
+                    except Exception as upsert_error:
+                        # Last fallback: simple insert without duplicate handling
+                        logger.warning(f"Upsert failed ({upsert_error}), trying simple insert without deduplication")
+                        doc_resp = self.supabase_client.client.table("document_metadata").insert({
+                            "title": doc_row["title"],
+                            "source_url": doc_row["source_url"],
+                            "doc_type": doc_row["doc_type"],
+                        }).execute()
+                        doc_id = doc_resp.data[0]["doc_id"]
+                        logger.info("Doc row (fallback insert) → title=%s", doc_row["title"])
             except Exception as schema_error:
                 # Fallback: Nutze alte Insert-Methode ohne neue Spalten
                 logger.warning(f"New schema not available, using fallback insert: {schema_error}")
@@ -135,15 +171,9 @@ class DocumentIngestionPipeline:
             file_extension = os.path.splitext(file_path)[1].lower()
             
             if file_extension == '.pdf':
-                # Statt alles zusammen → pro Seite chunken, damit page-Infos erhalten bleiben
-                chunks = []
-                for page_idx, page_text in enumerate(raw_content, start=1):
-                    page_chunks = self.chunker.chunk_text(page_text)
-                    # page-Nummer an jeden Chunk hängen
-                    for ch in page_chunks:
-                        ch["page"] = page_idx
-                    chunks.extend(page_chunks)
-                logger.info(f"PDF per-page chunked into {len(chunks)} chunks (keine Seiteninfos verloren)")
+                # Use AgenticSegmenter for intelligent chunking with heading detection
+                chunks = self.segmenter.segment_pages(raw_content)
+                logger.info(f"PDF processed with AgenticSegmenter into {len(chunks)} chunks with heading detection")
             elif file_extension == '.txt':
                 # For TXT files: Use processor output directly (already chunked)
                 chunks = raw_content
@@ -266,11 +296,28 @@ class DocumentIngestionPipeline:
                 # page bestimmen (TXT hat evtl. keine page-Info)
                 page = chunk.get("page") or 1
 
-                # token_count (Proxy) – tiktoken kannst du später ergänzen
-                token_count = len(chunk_text.split())
+                # token_count from chunk metadata if available (AgenticSegmenter provides this),
+                # otherwise calculate from text
+                if isinstance(chunk, dict) and "token_count" in chunk:
+                    token_count = chunk["token_count"]
+                else:
+                    # Fallback to word count estimation
+                    token_count = len(chunk_text.split())
 
-                # confidence aktuell parserbasiert
+                # confidence calculation with bonuses
                 confidence = base_conf
+                
+                # Bonus if heading was detected (section_heading or page_heading)
+                if (isinstance(chunk, dict) and 
+                    (chunk.get("section_heading") or chunk.get("page_heading"))):
+                    confidence += 0.02  # Small bonus for structured content
+                
+                # Bonus if chunk ends cleanly at sentence boundary
+                if chunk_text.rstrip().endswith(('.', '!', '?', '\n')):
+                    confidence += 0.01  # Small bonus for clean sentence endings
+                
+                # Clamp confidence to valid range [0, 1]
+                confidence = _clamp01(confidence)
 
                 # chunk_id: doc_id + page + laufende Nummer
                 chunk_id = f"{doc_id}:p{page}:{i+1}"
@@ -278,10 +325,19 @@ class DocumentIngestionPipeline:
                 # Chunk-Metadaten aufbauen
                 chunk_metadata = metadata.copy()
                 chunk_metadata["page"] = page
-                if "section_heading" in chunk:
-                    chunk_metadata["section_heading"] = chunk["section_heading"]
-                if "page_heading" in chunk:
-                    chunk_metadata["page_heading"] = chunk["page_heading"]
+                
+                # Extract headings from chunk if available
+                section_heading = None
+                page_heading = None
+                if isinstance(chunk, dict):
+                    section_heading = chunk.get("section_heading")
+                    page_heading = chunk.get("page_heading")
+                    
+                    # Add to metadata for compatibility
+                    if section_heading:
+                        chunk_metadata["section_heading"] = section_heading
+                    if page_heading:
+                        chunk_metadata["page_heading"] = page_heading
 
                 # EIN Insert mit allen neuen Spalten
                 stored_record = self.supabase_client.store_document_chunk(
@@ -292,8 +348,8 @@ class DocumentIngestionPipeline:
                     metadata=chunk_metadata,
                     # ⇩ neue Spalten
                     chunk_id=chunk_id,
-                    page_heading=chunk.get("page_heading"),
-                    section_heading=chunk.get("section_heading"),
+                    page_heading=page_heading,
+                    section_heading=section_heading,
                     token_count=token_count,
                     confidence=confidence,
                 )

@@ -87,8 +87,6 @@ from progress_tracker import ProgressTracker
 from helpers_progress import count_text_chars, estimate_total_chunks
 
 # Environment variables with defaults
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "5"))
 DB_BATCH_SIZE = int(os.getenv("DB_BATCH_SIZE", "100"))
 

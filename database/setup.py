@@ -40,17 +40,6 @@ class SupabaseClient:
         self.client = create_client(self.supabase_url, self.supabase_key)
 
     def insert_embedding(
-        self, text: str, metadata: dict, embedding: list, url: Optional[str] = None
-    ):
-        row = {
-            "content": text,
-            "metadata": metadata,
-            "embedding": embedding,
-        }
-        if url:
-            row["url"] = url
-
-    def insert_embedding(
         self,
         text: str,
         metadata: dict,
@@ -105,7 +94,8 @@ class SupabaseClient:
         if token_count is not None:
             data["token_count"] = token_count
         if confidence is not None:
-            data["confidence"] = confidence
+            # Ensure confidence is within valid range [0, 1]
+            data["confidence"] = max(0.0, min(1.0, float(confidence)))
 
         resp = self.client.table("rag_pages").insert(data).execute()
         # <- WICHTIG: Dict statt APIResponse zurückgeben
