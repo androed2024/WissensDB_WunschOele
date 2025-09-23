@@ -504,7 +504,7 @@ class DocumentIngestionPipeline:
             else:
                 # Use classic chunking for short notes
                 chunking_method = "classic"
-                chunks = chunker.chunk_text(content)
+                chunks = self.chunker.chunk_text(content)
                 
                 # Add metadata and set default values for compatibility
                 for chunk in chunks:
@@ -523,7 +523,7 @@ class DocumentIngestionPipeline:
                 logger.info(f"Manual note: agentic=No (tokens={note_tokens} < {min_tokens_for_agentic}), chunks={len(chunks)}")
         else:
             # Non-manual content - use classic chunking
-            chunks = chunker.chunk_text(content)
+            chunks = self.chunker.chunk_text(content)
             for chunk in chunks:
                 chunk["metadata"] = metadata.copy()
                 # Set default values for non-manual chunks

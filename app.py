@@ -114,7 +114,7 @@ from pydantic_ai.messages import (
 )
 
 st.set_page_config(
-    page_title="Wissens-Agent",
+    page_title="Wunsch Öle Wissens-Agent",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -1140,26 +1140,52 @@ async def main():
 
             # Speichern-Button
             if st.button("✅ Wissen / Notiz speichern", key="save_button"):
-                    # Clear any previous messages
+                    # Clear any previous messages and table
                     st.session_state.note_save_message = ""
+                    if "note_processing_table" in st.session_state:
+                        del st.session_state.note_processing_table
 
                     if not manual_title.strip() or not manual_text.strip():
                         st.warning(
                             "⚠️ Bitte gib sowohl eine Überschrift als auch einen Text ein."
                         )
                     else:
-                        existing = (
-                            supabase_client.client.table("rag_pages")
-                            .select("url")
-                            .ilike("url", f"{manual_title.strip()}%")
-                            .execute()
-                        )
-                        if existing.data:
-                            st.warning(
-                                f"⚠️ Ein Eintrag mit der Überschrift '{manual_title.strip()}' existiert bereits."
+                        # Initialize processing table
+                        table_data = [{
+                            "Titel": manual_title.strip(),
+                            "Fortschritt": "0%", 
+                            "Status": "⏳ Wartend"
+                        }]
+                        
+                        # Create table placeholder
+                        table_placeholder = st.empty()
+                        table_placeholder.table(table_data)
+                        
+                        def update_note_table(progress, status):
+                            table_data[0]["Fortschritt"] = progress
+                            table_data[0]["Status"] = status
+                            table_placeholder.table(table_data)
+                            st.session_state.note_processing_table = table_data.copy()
+
+                        try:
+                            # Step 1: Initial validation
+                            update_note_table("5%", "🔄 Prüfung...")
+                            
+                            existing = (
+                                supabase_client.client.table("rag_pages")
+                                .select("url")
+                                .ilike("url", f"{manual_title.strip()}%")
+                                .execute()
                             )
-                        else:
-                            try:
+                            if existing.data:
+                                update_note_table("Bereits vorhanden", "⚠️ Übersprungen")
+                                st.warning(
+                                    f"⚠️ Ein Eintrag mit der Überschrift '{manual_title.strip()}' existiert bereits."
+                                )
+                            else:
+                                # Step 2: Prepare filename
+                                update_note_table("10%", "🔄 Vorbereitung...")
+                                
                                 pipeline = DocumentIngestionPipeline()
                                 tz_berlin = pytz.timezone("Europe/Berlin")
                                 now_berlin = datetime.now(tz_berlin)
@@ -1196,7 +1222,9 @@ async def main():
                                 note_filename = f"{safe_title}_{now_berlin.strftime('%Y%m%d_%H%M')}.txt"
                                 note_content = f"Titel: {manual_title.strip()}\nQuelle: {source_type}\nErstellt: {timestamp}\n\n{manual_text}"
 
-                                # Speichere Notiz im Storage
+                                # Step 3: Storage upload
+                                update_note_table("20%", "📁 Storage-Upload...")
+                                
                                 storage_success = False
                                 try:
                                     # UTF-8 mit BOM für bessere Browser-Kompatibilität bei deutschen Umlauten
@@ -1223,10 +1251,13 @@ async def main():
                                     print(
                                         f"⚠️ Storage-Upload fehlgeschlagen: {storage_error}"
                                     )
-                                    print(f"   Verwende Fallback ohne Storage-Link")
-                                    # Fahre trotzdem fort - Notiz wird zumindest in der DB gespeichert
-
-                                # Metadaten abhängig vom Storage-Erfolg setzen
+                                    update_note_table("20%", "⚠️ Storage-Fehler (wird trotzdem fortgesetzt)")
+                                    # Kurz warten damit User die Meldung sieht
+                                    time.sleep(1)
+                                    
+                                # Step 4: Prepare metadata
+                                update_note_table("30%", "🔄 Metadaten...")
+                                
                                 if storage_success:
                                     metadata = {
                                         "source": "manuell",
@@ -1250,28 +1281,54 @@ async def main():
                                         "has_storage_file": False,
                                         "is_manual": True,  # Flag für manuelle Notizen
                                     }
+                                
+                                # Step 5: Text processing (Chunking + Embeddings + DB)
+                                update_note_table("40%", "🧠 Chunking & Embeddings...")
+                                
                                 result = pipeline.process_text(
                                     content=manual_text,
                                     metadata=metadata,
                                     url=manual_title.strip(),
                                 )
-                                # Set success message based on result
+                                
+                                # Step 6: Final result
                                 if result and result.get("status") == "duplicate":
+                                    update_note_table("Identisches Duplikat", "ℹ️ Übersprungen")
                                     st.session_state.note_save_message = (
                                         "ℹ️ Identische Notiz bereits vorhanden - nicht erneut gespeichert"
                                     )
                                 else:
+                                    chunks_count = result.get("chunks_count", 0) if result else 0
+                                    update_note_table(f"✅ {chunks_count} Chunks erstellt", "✅ Erfolgreich")
                                     st.session_state.note_save_message = (
                                         "✅ Wissen/Notizen erfolgreich gespeichert"
                                     )
+                                
                                 await update_available_sources()
-                                # Lösche Input-Felder nach erfolgreichem Speichern
-                                st.session_state.input_reset_counter += 1
-                                st.rerun()
-                            except Exception as e:
-                                # Set error message instead of direct error display
-                                st.session_state.note_save_message = f"❌ Fehler beim Speichern des Wissens/der Notiz: {e}"
+                                
+                                # Lösche Input-Felder nach erfolgreichem Speichern nur bei Erfolg
+                                if not (result and result.get("status") == "duplicate"):
+                                    # Clear table after successful processing
+                                    if "note_processing_table" in st.session_state:
+                                        del st.session_state.note_processing_table
+                                    st.session_state.input_reset_counter += 1
+                                    st.rerun()
+                                
+                        except Exception as e:
+                            # Set error message and update table
+                            error_msg = str(e)
+                            if "duplicate" in error_msg.lower():
+                                update_note_table("Duplikat gefunden", "⚠️ Übersprungen")
+                                st.session_state.note_save_message = "ℹ️ Identische Notiz bereits vorhanden"
+                            else:
+                                update_note_table(f"Fehler: {error_msg[:30]}...", "❌ Fehlgeschlagen") 
+                                st.session_state.note_save_message = f"❌ Fehler beim Speichern: {error_msg}"
 
+
+            # Always display persistent note processing table if it exists
+            if "note_processing_table" in st.session_state and st.session_state.note_processing_table:
+                st.subheader("📊 Notiz-Verarbeitung")
+                st.table(st.session_state.note_processing_table)
 
             # Display success/error message below buttons
             if st.session_state.note_save_message:
