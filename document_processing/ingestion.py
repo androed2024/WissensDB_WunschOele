@@ -131,18 +131,18 @@ class DocumentIngestionPipeline:
                         on_conflict_cols = "file_hash" if doc_row.get("file_hash") else "source_url"
                         doc_resp = self.supabase_client.client.table("document_metadata").upsert(doc_row, on_conflict=on_conflict_cols).execute()
                         doc_id = doc_resp.data[0]["doc_id"]
-                        logger.info("Doc row (upsert) → title=%s | on_conflict=%s",
-                                   doc_row["title"], on_conflict_cols)
+                        logger.info("Doc row (upsert) → title=%s | created(file)=%s | modified(file)=%s | on_conflict=%s",
+                                   doc_row["title"], doc_row.get("file_created_at"), doc_row.get("file_modified_at"), on_conflict_cols)
                     except Exception as upsert_error:
-                        # Last fallback: simple insert without duplicate handling
+                        # Last fallback: simple insert without duplicate handling, but keep all metadata
                         logger.warning(f"Upsert failed ({upsert_error}), trying simple insert without deduplication")
-                        doc_resp = self.supabase_client.client.table("document_metadata").insert({
-                            "title": doc_row["title"],
-                            "source_url": doc_row["source_url"],
-                            "doc_type": doc_row["doc_type"],
-                        }).execute()
+                        # Remove conflicting unique fields but keep all other metadata
+                        fallback_row = doc_row.copy()
+                        fallback_row.pop("file_hash", None)  # Remove file_hash to avoid conflicts
+                        doc_resp = self.supabase_client.client.table("document_metadata").insert(fallback_row).execute()
                         doc_id = doc_resp.data[0]["doc_id"]
-                        logger.info("Doc row (fallback insert) → title=%s", doc_row["title"])
+                        logger.info("Doc row (fallback insert) → title=%s | created(file)=%s | modified(file)=%s", 
+                                   fallback_row["title"], fallback_row.get("file_created_at"), fallback_row.get("file_modified_at"))
             except Exception as schema_error:
                 # Fallback: Nutze alte Insert-Methode ohne neue Spalten
                 logger.warning(f"New schema not available, using fallback insert: {schema_error}")
@@ -153,7 +153,8 @@ class DocumentIngestionPipeline:
                 }
                 doc_insert = self.supabase_client.client.table("document_metadata").insert(doc_row_basic).execute()
                 doc_id = doc_insert.data[0]["doc_id"]
-                logger.info("Doc row (insert fallback) → title=%s", doc_row_basic["title"])
+                logger.info("Doc row (insert fallback) → title=%s | NOTE: file_created_at/file_modified_at not saved due to old schema", doc_row_basic["title"])
+                logger.info("Missing metadata would be: created(file)=%s | modified(file)=%s", pdf_created or fs_ctime, pdf_modified or fs_mtime)
 
         except Exception as e:
             logger.error(f"Error getting document processor: {str(e)}")

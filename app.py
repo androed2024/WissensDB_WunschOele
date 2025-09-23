@@ -104,6 +104,8 @@ from agent.agent import (
     agent as rag_agent,
     format_source_reference,
     get_supabase_client,
+    AgenticRetrievalOrchestrator,
+    AgenticRetrievalConfig,
 )
 from pydantic_ai.messages import (
     ModelRequest,
@@ -117,7 +119,7 @@ st.set_page_config(
     page_title="Wunsch Öle Wissens-Agent",
     page_icon="🔍",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # CSS für kompakteres Layout
@@ -198,6 +200,160 @@ def render_header():
 
 
 supabase_client = SupabaseClient()
+
+# Initialize Agentic Retrieval Orchestrator
+agentic_orchestrator = AgenticRetrievalOrchestrator()
+
+async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig) -> Dict[str, Any]:
+    """
+    Run agentic retrieval and return the result.
+    
+    Args:
+        user_input: User's question
+        config: Agentic retrieval configuration
+        
+    Returns:
+        Dict with answer and source chunks
+    """
+    print(f"\n🔵 [USER INPUT] Original-Frage (Agentisch): {user_input}")
+    
+    try:
+        result = await agentic_orchestrator.run(user_input, config)
+        
+        # Set last_match for UI compatibility  
+        if hasattr(rag_agent, 'last_match'):
+            rag_agent.last_match = result.get('source_chunks', [])
+        else:
+            rag_agent.last_match = result.get('source_chunks', [])
+            
+        return result
+        
+    except Exception as e:
+        print(f"❌ Agentisches Retrieval Fehler: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "answer": "Es ist ein Fehler beim agentischen Retrieval aufgetreten.",
+            "source_chunks": [],
+            "error": str(e)
+        }
+
+
+def render_agentic_config_sidebar():
+    """Render sidebar with agentic retrieval configuration."""
+    with st.sidebar:
+        st.markdown("## 🤖 Agentisches Retrieval")
+        
+        # Toggle for agentic retrieval
+        use_agentic = st.toggle(
+            "Aktiviere Agentisches Retrieval",
+            value=False,
+            key="use_agentic_retrieval",
+            help="Mehrstufige intelligente Suche mit Planung und Evidenz-Bündelung"
+        )
+        
+        if use_agentic:
+            st.markdown("### ⚙️ Konfiguration")
+            
+            # Max rounds
+            max_rounds = st.slider(
+                "Max. Such-Runden", 
+                min_value=1, 
+                max_value=6, 
+                value=2, 
+                key="agentic_max_rounds",
+                help="Maximale Anzahl der Such-Runden (2 für schnelle Antworten, 4+ für komplexe Cross-Source-Fragen)"
+            )
+            
+            # K per round
+            k_per_round = st.slider(
+                "Kandidaten pro Runde",
+                min_value=5,
+                max_value=30,
+                value=15,
+                key="agentic_k_per_round", 
+                help="Anzahl der Dokumente die pro Such-Runde abgerufen werden"
+            )
+            
+            # Token budget
+            token_budget = st.slider(
+                "Token-Budget",
+                min_value=500,
+                max_value=4000,
+                value=2000,
+                key="agentic_token_budget",
+                help="Maximale Tokens für den Kontext (ca. 1500 Wörter)"
+            )
+            
+            # Min similarity  
+            min_similarity = st.slider(
+                "Min. Ähnlichkeit",
+                min_value=0.1,
+                max_value=0.9,
+                value=0.55,
+                step=0.05,
+                key="agentic_min_sim",
+                help="Mindest-Ähnlichkeitsscore für Dokumente"
+            )
+            
+            # Speed vs Quality toggle (prominent placement)
+            quality_over_speed = st.toggle(
+                "🎯 Qualität über Geschwindigkeit",
+                value=False,
+                key="agentic_quality_over_speed",
+                help="Aktiviert: Vollständige Suche für beste Ergebnisse | Deaktiviert: Schnelle Antworten mit Early Stopping"
+            )
+            
+            # Advanced options in expander
+            with st.expander("🔧 Erweiterte Optionen"):
+                recency_halflife = st.number_input(
+                    "Recency Halflife (Tage)",
+                    min_value=1,
+                    max_value=365,
+                    value=30,
+                    key="agentic_recency_halflife",
+                    help="Halbwertszeit für Aktualitäts-Bonus in Tagen"
+                )
+                
+                doc_type_pref = st.selectbox(
+                    "Dokumenttyp-Präferenz",
+                    options=[None, "pdf", "txt", "manuell"],
+                    index=0,
+                    key="agentic_doc_type_pref",
+                    help="Bevorzugter Dokumenttyp (None = alle)"
+                )
+                
+                enable_filters = st.checkbox(
+                    "Erweiterte Filter aktivieren",
+                    value=True,
+                    key="agentic_enable_filters",
+                    help="Nutze Confidence-, Recency- und andere Filter"
+                )
+                
+                early_stopping_threshold = st.slider(
+                    "Early Stopping Threshold",
+                    min_value=0.6,
+                    max_value=0.9,
+                    value=0.75,
+                    step=0.05,
+                    key="agentic_early_stopping",
+                    help="Stoppe vorzeitig bei sehr guten Matches (höher = anspruchsvoller)"
+                )
+            
+            return AgenticRetrievalConfig(
+                max_rounds=max_rounds,
+                k_per_round=k_per_round,
+                token_budget=token_budget,
+                min_similarity=min_similarity,
+                recency_halflife_days=recency_halflife,
+                doc_type_preference=doc_type_pref,
+                enable_filters=enable_filters,
+                early_stopping_threshold=early_stopping_threshold,
+                quality_over_speed=quality_over_speed
+            )
+        
+        return None
+
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -627,6 +783,9 @@ async def main():
     # Erst Daten laden, dann Header rendern
     await update_available_sources()
     render_header()
+    
+    # Render agentic config sidebar and get config
+    agentic_config = render_agentic_config_sidebar()
 
     doc_count = st.session_state.get("document_count", 0)
     note_count = st.session_state.get("knowledge_count", 0)
@@ -717,9 +876,18 @@ async def main():
                     message_placeholder = st.empty()
                     full_response = ""
 
-                    async for chunk in run_agent_with_streaming(user_input):
-                        full_response += chunk
-                        message_placeholder.markdown(full_response + "▌")
+                    # Choose between agentic and classic retrieval
+                    if agentic_config is not None:
+                        # Use agentic retrieval (silently in background)
+                        agentic_result = await run_agentic_retrieval(user_input, agentic_config)
+                        full_response = agentic_result.get("answer", "")
+                        message_placeholder.markdown(full_response)
+                        
+                    else:
+                        # Use classic streaming retrieval
+                        async for chunk in run_agent_with_streaming(user_input):
+                            full_response += chunk
+                            message_placeholder.markdown(full_response + "▌")
 
                     # Chatbot Interface - Quellenangaben verarbeiten
                     pdf_sources = defaultdict(set)
@@ -744,18 +912,33 @@ async def main():
                                 all_matches.append((match, sim))
                                 best_score = max(best_score, sim)
 
-                        # Intelligente Filterung: Wenn der beste Score deutlich höher ist,
-                        # zeige nur Quellen, die nah am besten Score sind
-                        RELEVANCE_GAP_THRESHOLD = (
-                            0.13  # Wenn Unterschied > 13%, filtere schwächere Quellen
-                        )
+                        # Intelligente Filterung: Weniger aggressiv für Cross-Source-Queries
+                        # Check if we have potential cross-source results (different doc types/sources)
+                        unique_sources = set()
+                        metadata_matches = 0
+                        
+                        for match in rag_agent.last_match:
+                            meta = match.get("metadata", {})
+                            source_type = meta.get("source", "")
+                            unique_sources.add(source_type)
+                            if match.get("source_type") == "metadata_match":
+                                metadata_matches += 1
+                        
+                        has_cross_source = len(unique_sources) > 1 or metadata_matches > 0
+                        
+                        if has_cross_source:
+                            # Less aggressive filtering for cross-source queries
+                            RELEVANCE_GAP_THRESHOLD = 0.20  # More lenient: 20% gap allowed
+                            print("🔄 Cross-Source detected: Using lenient filtering")
+                        else:
+                            # Standard filtering for single-source queries
+                            RELEVANCE_GAP_THRESHOLD = 0.13  # Standard: 13% gap
 
                         if best_score > 0:
-                            # Universelle Gap-basierte Filterung (generisch für alle Anwendungsfälle)
                             gap_threshold = best_score - RELEVANCE_GAP_THRESHOLD
                             effective_threshold = max(DISPLAY_MIN_SIM, gap_threshold)
                             print(
-                                f"🎯 Intelligente Filterung: Bester Score {best_score:.3f}, Effektiver Threshold: {effective_threshold:.3f}"
+                                f"🎯 Intelligente Filterung: Bester Score {best_score:.3f}, Effektiver Threshold: {effective_threshold:.3f} (Cross-Source: {has_cross_source})"
                             )
                         else:
                             effective_threshold = DISPLAY_MIN_SIM
@@ -1678,8 +1861,48 @@ async def main():
                             }
 
                             def on_phase(phase: str, processed: int, total: int):
-                                # ... bestehender on_phase Code bleibt unverändert ...
-                                pass
+                                """Update progress table based on processing phase."""
+                                try:
+                                    if phase == "chunk":
+                                        # P2: Chunking phase (agentisch oder klassisch)
+                                        if total > 0:
+                                            progress = max(60, min(75, 60 + (processed / total) * 15))
+                                            update_table_row(uploaded_file.name, f"{progress:.0f}%", f"🔪 Chunking ({processed}/{total})...")
+                                        else:
+                                            update_table_row(uploaded_file.name, "60%", "🔪 Chunking...")
+                                    
+                                    elif phase == "embed":
+                                        # P3: Embedding generation
+                                        if total > 0:
+                                            progress = max(75, min(90, 75 + (processed / total) * 15))
+                                            update_table_row(uploaded_file.name, f"{progress:.0f}%", f"🧠 Embeddings ({processed}/{total})...")
+                                        else:
+                                            update_table_row(uploaded_file.name, "75%", "🧠 Embeddings...")
+                                    
+                                    elif phase == "db":
+                                        # P4: Database insertion
+                                        if total > 0:
+                                            progress = max(90, min(98, 90 + (processed / total) * 8))
+                                            update_table_row(uploaded_file.name, f"{progress:.0f}%", f"💾 DB-Speicherung ({processed}/{total})...")
+                                        else:
+                                            update_table_row(uploaded_file.name, "90%", "💾 DB-Speicherung...")
+                                    
+                                    elif phase == "finalize":
+                                        # P5: Finalization (from process_document)
+                                        if processed == 0:
+                                            update_table_row(uploaded_file.name, "98%", "🔧 Finalisierung...")
+                                        else:
+                                            update_table_row(uploaded_file.name, "99%", "✅ Abschluss...")
+                                    
+                                    else:
+                                        # Unknown phase - log for debugging
+                                        print(f"🐛 Unknown phase: {phase} ({processed}/{total})")
+                                        progress = max(50, min(98, 50 + (processed / max(total, 1)) * 45))
+                                        update_table_row(uploaded_file.name, f"{progress:.0f}%", f"🔄 {phase.title()}...")
+                                        
+                                except Exception as e:
+                                    print(f"⚠️ Progress update error for {uploaded_file.name}: {e}")
+                                    # Continue processing even if UI update fails
 
                             result = await process_document(
                                 temp_file_path,

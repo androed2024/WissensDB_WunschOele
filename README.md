@@ -1,96 +1,77 @@
-# RAG AI Agent with Pydantic AI and Supabase
 
-A simple Retrieval-Augmented Generation (RAG) AI agent using Pydantic AI and Supabase with pgvector for document storage and retrieval.
+### **Konfiguration über Environment Variables**
 
-## Features
+**Basic Configuration:**
+```bash
+# API Keys
+OPENAI_API_KEY=sk-...
+SUPABASE_URL=https://....supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
 
-- Document ingestion pipeline for TXT and PDF files
-- Vector embeddings using OpenAI
-- Document storage in Supabase with pgvector
-- Pydantic AI agent with knowledge base search capabilities
-- Streamlit UI for document uploads and agent interaction
-
-## Project Structure
-
-```
-foundational-rag-agent/
-├── database/
-│   └── setup.py          # Database setup and connection utilities
-├── document_processing/
-│   ├── __init__.py
-│   ├── chunker.py        # Text chunking functionality
-│   ├── embeddings.py     # Embeddings generation with OpenAI
-│   ├── ingestion.py      # Document ingestion pipeline
-│   └── processors.py     # TXT and PDF processing
-├── agent/
-│   ├── __init__.py
-│   ├── agent.py          # Main agent definition
-│   ├── prompts.py        # System prompts
-│   └── tools.py          # Knowledge base search tool
-├── ui/
-│   └── app.py            # Streamlit application
-├── tests/
-│   ├── test_chunker.py
-│   ├── test_embeddings.py
-│   ├── test_ingestion.py
-│   ├── test_processors.py
-│   └── test_agent.py
-├── .env.example          # Example environment variables
-├── requirements.txt      # Project dependencies
-├── PLANNING.md           # Project planning document
-├── TASK.md               # Task tracking
-└── README.md             # Project documentation
+# Model Configuration  
+OPENAI_MODEL=gpt-4o-mini
+EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-## Setup
+**Agentic Chunking Parameters:**
+```bash
+RAG_MAX_TOKENS=500              # Maximale Chunk-Größe
+RAG_SOFT_MAX_TOKENS=650         # Soft-Limit für große Chunks
+RAG_MIN_TOKENS=120              # Minimum für Chunk-Merging
+RAG_OVERLAP_TOKENS=40           # Overlap zwischen Chunks
 
-1. Clone the repository
-2. Create a virtual environment:
-   ```
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-4. Copy `.env.example` to `.env` and fill in your API keys and configuration
-5. Run the Streamlit application:
-   ```
-   streamlit run ui/app.py
-   ```
-6. Run the SQL in `rag-example.sql` to create the table and matching function for RAG
-7. create execute_sql function
-   in supabase SQL editor:
-      -- Eine einfache RPC-Funktion, um beliebige SQL-Statements (z.B. DELETE) auszuführen
-      -- ACHTUNG: Verwende sie nur mit serverseitigen Keys (nicht öffentlich zugänglich machen!)
-      create or replace function execute_sql(query text)
-      returns void
-      language plpgsql
-      as $$
-      begin
-      execute query;
-      end;
-      $$;
-8. Delete all entries in supabase db:
-      DELETE FROM rag_pages;
+RAG_ENABLE_AGENTIC_FOR_NOTES=true
+RAG_NOTE_AGENTIC_MIN_TOKENS=300 # Schwelle für agentisches Chunking bei Notizen
+```
 
+**Agentic Retrieval Parameters:**
+```bash
+RAG_ROUNDS=3                    # Maximale Such-Runden
+K_PER_ROUND=15                  # Kandidaten pro Runde
+MIN_SIM=0.55                    # Minimum Similarity Score
+RAG_TOKEN_BUDGET=2000           # Kontext-Token-Budget
+RECENCY_HALFLIFE_DAYS=30        # Halbwertszeit für Aktualitäts-Bonus
+DOC_TYPE_PREFERENCE=pdf         # Bevorzugter Dokumenttyp
+RAG_ENABLE_FILTERS=true         # Erweiterte Filter aktivieren
+```
 
-## Usage
+### **Database Schema**
 
-1. Upload documents (TXT or PDF) through the Streamlit UI
-2. Ask questions to the AI agent
-3. View responses with source attribution
+**rag_pages** (Haupttabelle für Chunks):
+```sql
+- id: UUID (Primary Key)
+- content: TEXT (Chunk-Inhalt)
+- embedding: vector(1536) (OpenAI Embedding)
+- url: TEXT (Dokument-Identifier)
+- metadata: JSONB (Erweiterte Metadaten)
+- page: INTEGER (Seitenzahl)
+- page_heading: TEXT (Seiten-Überschrift)
+- section_heading: TEXT (Abschnitts-Überschrift)  
+- token_count: INTEGER (Präzise Token-Anzahl)
+- confidence: REAL (Quality Score 0.0-1.0)
+- chunk_number: INTEGER (Position im Dokument)
+- created_at: TIMESTAMP
+```
 
-## Dependencies
+**document_metadata** (Dokument-Übersicht):
+```sql
+- doc_id: UUID (Primary Key)
+- title: TEXT (Dokument-Titel)
+- source_url: TEXT (Original-Pfad)
+- file_size_bytes: BIGINT
+- created_at: TIMESTAMP
+- file_modified_at: TIMESTAMP (aus Datei-Metadaten)
+```
 
-- Python 3.11+
-- Pydantic AI
-- Supabase
-- OpenAI
-- PyPDF2
-- Streamlit
+**chat_history** (Konversations-Historie):
+```sql
+- id: UUID (Primary Key)  
+- question: TEXT (Benutzer-Frage)
+- answer: TEXT (Agent-Antwort)
+- username: TEXT (Benutzer-ID)
+- created_at: TIMESTAMP
+```
 
-## License
+---
 
-MIT
+**🚀 Dieses System repräsentiert den aktuellen Stand der RAG-Technologie mit agentischen KI-Methoden für optimale Wissensextraktion und -bereitstellung.**
