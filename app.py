@@ -318,6 +318,28 @@ def get_db_client_for_admin_operations():
     else:
         return get_sb_user()  # User-Client für normale User
 
+def get_db_client_for_chat_operations():
+    """
+    Hole den passenden DB-Client für Chat-Historie-Operationen.
+    Alle berechtigten User (chatbot_user, data_user, admin) bekommen Service-Client,
+    da RLS-Policies für chat_history oft zu restriktiv sind.
+    """
+    if has_role("chatbot_user", "data_user", "admin"):
+        return SB_ADMIN  # Service-Client für alle Chat-berechtigten User
+    else:
+        return get_sb_user()  # User-Client als Fallback
+
+def get_db_client_for_upload_operations():
+    """
+    Hole den passenden DB-Client für Upload-/Document-Processing-Operationen.
+    data_user und admin bekommen Service-Client für uneingeschränkten Upload-Zugriff,
+    da RLS-Policies für document_metadata und rag_pages oft zu restriktiv sind.
+    """
+    if has_role("data_user", "admin"):
+        return SB_ADMIN  # Service-Client für Upload-berechtigte User
+    else:
+        return get_sb_user()  # User-Client als Fallback
+
 def has_role(*wanted):
     roles = st.session_state.get("roles", []) or []
     return ("admin" in roles) or any(r in roles for r in wanted)
@@ -592,8 +614,8 @@ async def process_document(
     Returns:
         Dict mit success, chunk_count und ggf. error
     """
-    # Use appropriate client (Service for admin, User for others)
-    sb = get_db_client_for_admin_operations()
+    # Use appropriate client (Service for data_user and admin, User for others)
+    sb = get_db_client_for_upload_operations()
     pipeline = DocumentIngestionPipeline(db_client=sb)
     loop = asyncio.get_event_loop()
 
@@ -691,8 +713,8 @@ async def run_agent_with_streaming(user_input: str, rag_agent_instance):
 def get_chat_history(search_term: str = "") -> List[Dict]:
     """Holt Chat-Historie aus Supabase mit optionaler Wildcard-Suche"""
     try:
-        # Für Admins Service-Client verwenden, für normale User RLS-Client
-        sb = get_db_client_for_admin_operations()
+        # Service-Client für alle Chat-berechtigten User (chatbot_user, data_user, admin)
+        sb = get_db_client_for_chat_operations()
         query = sb.table("chat_history").select("*")
 
         if search_term.strip():
@@ -930,8 +952,8 @@ async def update_available_sources():
     try:
         # response = (supabase_client.client.table("rag_pages").select("url, metadata").execute()
 
-        # neu (Service-Client für Admin, RLS für User):
-        sb = get_db_client_for_admin_operations()
+        # neu (Service-Client für data_user und admin, RLS für andere):
+        sb = get_db_client_for_upload_operations()
         response = sb.table("rag_pages").select("url, metadata").execute()
 
 
@@ -1995,9 +2017,9 @@ async def main():
                                     last_msg.parts[i] = TextPart(content=final_response)
                                     break
 
-                                        # 💾 Chat-Historie speichern (Service-Client für Admin, User-Client für andere)
+                                        # 💾 Chat-Historie speichern (Service-Client für alle Chat-berechtigten User)
                     try:
-                        sb = get_db_client_for_admin_operations()
+                        sb = get_db_client_for_chat_operations()
                         # Versuche zuerst mit user_id, bei Fehler ohne user_id
                         chat_record = {
                             "user_name": st.session_state["user"].email or "user",
@@ -2103,7 +2125,7 @@ async def main():
                             # Step 1: Initial validation
                             update_note_table("5%", "🔄 Prüfung...")
                             
-                            sb = get_db_client_for_admin_operations()
+                            sb = get_db_client_for_upload_operations()
                             existing = (
                                 sb.table("rag_pages")
                                 .select("url")
@@ -2119,8 +2141,8 @@ async def main():
                                 # Step 2: Prepare filename
                                 update_note_table("10%", "🔄 Vorbereitung...")
                                 
-                                # Use appropriate client (Service for admin, User for others)
-                                sb_user = get_db_client_for_admin_operations()
+                                # Use appropriate client (Service for data_user and admin, User for others)
+                                sb_user = get_db_client_for_upload_operations()
                                 pipeline = DocumentIngestionPipeline(db_client=sb_user)
                                 tz_berlin = pytz.timezone("Europe/Berlin")
                                 now_berlin = datetime.now(tz_berlin)
@@ -2441,7 +2463,7 @@ async def main():
                             file_hash = compute_file_hash(file_bytes)
 
                             # 🔍 Duplikatprüfung anhand Hash
-                            sb = get_db_client_for_admin_operations()
+                            sb = get_db_client_for_upload_operations()
                             existing_hash = (
                                 sb.table("rag_pages")
                                 .select("id")
@@ -2458,7 +2480,7 @@ async def main():
                                 continue
 
                             # ✅ Duplikatprüfung vor Upload
-                            sb = get_db_client_for_admin_operations()
+                            sb = get_db_client_for_upload_operations()
                             existing = (
                                 sb.table("rag_pages")
                                 .select("id")
