@@ -397,27 +397,18 @@ def set_roles(uid: str, roles: list):
         st.error(f"Fehler beim Setzen der Rollen: {e}")
         return False
 
-def create_user(email: str, roles: list, password: str = None):
+def create_user(email: str, roles: list, password: str):
     """Neuen Benutzer erstellen."""
     try:
         user_data = {
             "email": email,
+            "password": password,
             "email_confirm": True,
             "app_metadata": {"roles": roles}
         }
         
-        if password:
-            user_data["password"] = password
-            result = SB_ADMIN.auth.admin.create_user(user_data)
-            st.success("Benutzer angelegt, kann sich sofort anmelden.")
-        else:
-            result = SB_ADMIN.auth.admin.create_user(user_data)
-            # Recovery-Mail senden
-            sb_auth.auth.reset_password_for_email(
-                email, 
-                options={"redirect_to": os.environ.get("APP_BASE_URL", "http://localhost:8501/")}
-            )
-            st.success("Benutzer angelegt. Recovery-Mail gesendet.")
+        result = SB_ADMIN.auth.admin.create_user(user_data)
+        st.success("Benutzer angelegt, kann sich sofort anmelden.")
         return True
     except Exception as e:
         st.error(f"Fehler beim Erstellen des Benutzers: {e}")
@@ -432,18 +423,6 @@ def delete_user(uid: str):
         st.error(f"Fehler beim Löschen des Benutzers: {e}")
         return False
 
-def send_recovery(email: str):
-    """Recovery-Mail senden."""
-    try:
-        sb_auth.auth.reset_password_for_email(
-            email, 
-            options={"redirect_to": os.environ.get("APP_BASE_URL", "http://localhost:8501/")}
-        )
-        st.success("Recovery-Mail gesendet.")
-        return True
-    except Exception as e:
-        st.error(f"Fehler beim Senden der Recovery-Mail: {e}")
-        return False
 
 # ==== Ende Admin-Funktionen ====
 
@@ -1063,7 +1042,7 @@ async def main():
             
             with col1:
                 new_email = st.text_input("E-Mail-Adresse", key="new_user_email")
-                new_password = st.text_input("Passwort (optional - wenn leer, wird Recovery-Mail gesendet)", 
+                new_password = st.text_input("Passwort (erforderlich, mind. 8 Zeichen)", 
                                            type="password", key="new_user_password")
             
             with col2:
@@ -1073,20 +1052,27 @@ async def main():
                 role_chat = st.checkbox("chatbot_user", key="new_user_chat")
             
             if st.button("Benutzer anlegen", type="primary"):
-                if new_email.strip():
-                    roles = []
-                    if role_admin: roles.append("admin")
-                    if role_data: roles.append("data_user") 
-                    if role_chat: roles.append("chatbot_user")
+                if not new_email.strip():
+                    st.error("Bitte E-Mail eingeben.")
+                    st.stop()
+                if not new_password.strip():
+                    st.error("Bitte ein Passwort eingeben.")
+                    st.stop()
+                if len(new_password.strip()) < 8:
+                    st.error("Passwort zu kurz (mind. 8 Zeichen).")
+                    st.stop()
                     
-                    if roles:
-                        password = new_password.strip() if new_password.strip() else None
-                        if create_user(new_email.strip(), roles, password):
-                            st.rerun()
-                    else:
-                        st.error("Mindestens eine Rolle muss ausgewählt werden.")
-                else:
-                    st.error("E-Mail-Adresse ist erforderlich.")
+                roles = []
+                if role_admin: roles.append("admin")
+                if role_data: roles.append("data_user") 
+                if role_chat: roles.append("chatbot_user")
+                
+                if not roles:
+                    st.error("Mindestens eine Rolle muss ausgewählt werden.")
+                    st.stop()
+                    
+                if create_user(new_email.strip(), roles, new_password.strip()):
+                    st.rerun()
         
         st.markdown("---")
         
@@ -1130,10 +1116,6 @@ async def main():
                                 st.success("Rollen aktualisiert!")
                                 st.rerun()
                         
-                        if st.button("📧 Recovery senden", key=f"recovery_{user['id']}"):
-                            if send_recovery(user['email']):
-                                st.rerun()
-                        
                         # Sicherheitsabfrage für Löschen
                         delete_confirm = st.checkbox("Bestätigen", key=f"confirm_{user['id']}")
                         if st.button("🗑️ Löschen", 
@@ -1148,12 +1130,12 @@ async def main():
             st.info("Keine Benutzer gefunden oder Fehler beim Laden.")
         
         # Hinweise
-        st.markdown("#### ℹ️ Hinweise")
-        st.info("""
-        - Nach Rollen-Updates müssen betroffene Benutzer sich neu einloggen
-        - Der Service-Client wird nur serverseitig verwendet 
-        - Alle RLS-Policies bleiben für normale Datenbankabfragen aktiv
-        """)
+        with st.expander("Hinweise", expanded=True):
+            st.markdown("- Passwörter können Benutzer im User-Menü oben rechts selbst ändern.")
+            st.markdown("- E-Mail-Recovery ist in dieser App nicht aktiv.")
+            st.markdown("- Nach Rollen-Updates müssen betroffene Benutzer sich neu einloggen.")
+            st.markdown("- Der Service-Client wird nur serverseitig verwendet.")
+            st.markdown("- Alle RLS-Policies bleiben für normale Datenbankabfragen aktiv.")
 
     async def render_delete_preview_ui():
         """Renders the complete document/note preview and delete UI."""
