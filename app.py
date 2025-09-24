@@ -313,7 +313,7 @@ def get_db_client_for_admin_operations():
     Admins bekommen Service-Client für uneingeschränkten Zugriff,
     normale User bekommen User-Client mit RLS.
     """
-    if has_role("admin"):
+    if get_user_role() == "admin":
         return SB_ADMIN  # Service-Client für Admins
     else:
         return get_sb_user()  # User-Client für normale User
@@ -324,7 +324,7 @@ def get_db_client_for_chat_operations():
     Alle berechtigten User (chatbot_user, data_user, admin) bekommen Service-Client,
     da RLS-Policies für chat_history oft zu restriktiv sind.
     """
-    if has_role("chatbot_user", "data_user", "admin"):
+    if has_permission("chat"):
         return SB_ADMIN  # Service-Client für alle Chat-berechtigten User
     else:
         return get_sb_user()  # User-Client als Fallback
@@ -335,14 +335,26 @@ def get_db_client_for_upload_operations():
     data_user und admin bekommen Service-Client für uneingeschränkten Upload-Zugriff,
     da RLS-Policies für document_metadata und rag_pages oft zu restriktiv sind.
     """
-    if has_role("data_user", "admin"):
+    if has_permission("upload"):
         return SB_ADMIN  # Service-Client für Upload-berechtigte User
     else:
         return get_sb_user()  # User-Client als Fallback
 
-def has_role(*wanted):
-    roles = st.session_state.get("roles", []) or []
-    return ("admin" in roles) or any(r in roles for r in wanted)
+def get_user_role():
+    """Gibt die eine Rolle des Users zurück"""
+    roles = st.session_state.get("roles", [])
+    return roles[0] if roles else None
+
+def has_permission(feature: str):
+    """Prüft Berechtigung basierend auf Rollenhierarchie"""
+    role = get_user_role()
+    if role == "admin":
+        return True  # Admin kann alles
+    elif role == "data_user":
+        return feature in ["chat", "upload", "delete", "notes", "chat_history"]
+    elif role == "chatbot_user": 
+        return feature in ["chat", "chat_history"]
+    return False
 
 def user_menu():
     """Popover rechts oben: Rollen anzeigen, Passwort ändern, Logout."""
@@ -599,14 +611,17 @@ async def process_document(
     loop = asyncio.get_event_loop()
 
     try:
-        # P4: Finalisierung wird am Ende aufgerufen
+        # P4: Finalisierung wird am Ende aufgerufen  
         def wrapped_on_phase(phase: str, processed: int, total: int):
             if on_phase:
                 try:
+                    # Execute callback in thread-safe manner
                     on_phase(phase, processed, total)
                 except Exception as e:
-                    print(f"⚠️ Fehler bei Progress-Update ({phase}): {e}")
-                    # Continue processing even if UI update fails
+                    # Suppress ScriptRunContext errors - they're expected from background threads
+                    if "ScriptRunContext" not in str(e):
+                        print(f"⚠️ Fehler bei Progress-Update ({phase}): {e}")
+                    # Always continue processing even if UI update fails
 
         chunks = await loop.run_in_executor(
             None,
@@ -1008,19 +1023,19 @@ async def main():
     tab_labels = []
     
     # Chat-Bereich (chatbot_user, data_user, admin)
-    if has_role("chatbot_user", "data_user", "admin"):
+    if has_permission("chat"):
         tab_labels.append("💬 Wunsch-Öle KI Assistent")
     
     # Wissen hinzufügen / Doku hochladen (data_user, admin)  
-    if has_role("data_user", "admin"):
+    if has_permission("upload"):
         tab_labels.append("➕ Wissen hinzufügen")
     
     # Dokumente anzeigen / löschen (data_user, admin)
-    if has_role("data_user", "admin"):
+    if has_permission("delete"):
         tab_labels.append("🗑️ Dokument anzeigen / löschen")
     
     # Benutzerverwaltung (nur admin)
-    if has_role("admin"):
+    if get_user_role() == "admin":
         tab_labels.append("👤 Benutzerverwaltung")
     
     if not tab_labels:
@@ -1046,10 +1061,18 @@ async def main():
                                            type="password", key="new_user_password")
             
             with col2:
-                st.markdown("**Rollen:**")
-                role_admin = st.checkbox("admin", key="new_user_admin")
-                role_data = st.checkbox("data_user", key="new_user_data")
-                role_chat = st.checkbox("chatbot_user", key="new_user_chat")
+                st.markdown("**Rolle auswählen:**")
+                selected_role = st.radio(
+                    "",
+                    options=["admin", "data_user", "chatbot_user"],
+                    format_func=lambda x: {
+                        "admin": "🔧 Administrator (alle Rechte)",
+                        "data_user": "📊 Data User (Dokumente verwalten + Chat)", 
+                        "chatbot_user": "💬 Chatbot User (nur Chat + Historie)"
+                    }[x],
+                    key="new_user_role",
+                    label_visibility="collapsed"
+                )
             
             if st.button("Benutzer anlegen", type="primary"):
                 if not new_email.strip():
@@ -1062,16 +1085,7 @@ async def main():
                     st.error("Passwort zu kurz (mind. 8 Zeichen).")
                     st.stop()
                     
-                roles = []
-                if role_admin: roles.append("admin")
-                if role_data: roles.append("data_user") 
-                if role_chat: roles.append("chatbot_user")
-                
-                if not roles:
-                    st.error("Mindestens eine Rolle muss ausgewählt werden.")
-                    st.stop()
-                    
-                if create_user(new_email.strip(), roles, new_password.strip()):
+                if create_user(new_email.strip(), [selected_role], new_password.strip()):
                     st.rerun()
         
         st.markdown("---")
@@ -1090,30 +1104,28 @@ async def main():
                         st.caption(f"ID: {user['id'][:8]}...")
                     
                     with col2:
-                        st.markdown("**Rollen:**")
+                        st.markdown("**Rolle:**")
                         user_roles = user.get('roles', [])
+                        current_role = user_roles[0] if user_roles else "chatbot_user"
                         
-                        # Checkboxen für Rollen (unique keys mit user_id)
-                        admin_checked = st.checkbox("admin", 
-                                                  value="admin" in user_roles,
-                                                  key=f"admin_{user['id']}")
-                        data_checked = st.checkbox("data_user", 
-                                                 value="data_user" in user_roles,
-                                                 key=f"data_{user['id']}")
-                        chat_checked = st.checkbox("chatbot_user", 
-                                                 value="chatbot_user" in user_roles,
-                                                 key=f"chat_{user['id']}")
+                        new_role = st.radio(
+                            "",
+                            options=["admin", "data_user", "chatbot_user"],
+                            format_func=lambda x: {
+                                "admin": "🔧 Administrator",
+                                "data_user": "📊 Data User",
+                                "chatbot_user": "💬 Chatbot User"
+                            }[x],
+                            index=["admin", "data_user", "chatbot_user"].index(current_role),
+                            key=f"role_{user['id']}",
+                            label_visibility="collapsed"
+                        )
                     
                     with col3:
                         # Action Buttons
-                        if st.button("💾 Rollen speichern", key=f"save_{user['id']}"):
-                            new_roles = []
-                            if admin_checked: new_roles.append("admin")
-                            if data_checked: new_roles.append("data_user")
-                            if chat_checked: new_roles.append("chatbot_user")
-                            
-                            if set_roles(user['id'], new_roles):
-                                st.success("Rollen aktualisiert!")
+                        if st.button("💾 Rolle speichern", key=f"save_{user['id']}"):
+                            if set_roles(user['id'], [new_role]):
+                                st.success("Rolle aktualisiert!")
                                 st.rerun()
                         
                         # Sicherheitsabfrage für Löschen
@@ -1170,7 +1182,7 @@ async def main():
         )
 
         # Zeige Vorschau nur wenn Benutzer die del-Berechtigung hat
-        if st.session_state.sources and has_role("data_user", "admin"):
+        if st.session_state.sources and has_permission("delete"):
             delete_filename = st.selectbox(
                 "Dokument/Notiz selektieren", st.session_state.sources
             )
@@ -1532,7 +1544,7 @@ async def main():
             st.info("Keine Dokumente/Notizen zur Löschung verfügbar.")
 
     # Chat-Tab (immer der erste verfügbare Tab für berechtigte Benutzer)
-    if has_role("chatbot_user", "data_user", "admin"):
+    if has_permission("chat"):
         with tabs[current_tab]:
             # Erstelle Untermenü mit zwei Optionen (ohne doppelten Titel)
             chat_tab1, chat_tab2 = st.tabs(["Chat", "Chat Historie"])
@@ -2033,9 +2045,9 @@ async def main():
             render_chat_history()
 
     # Add-Tab (zweiter Tab wenn verfügbar)
-    if has_role("data_user", "admin"):
+    if has_permission("upload"):
         tab_index = 0
-        if has_role("chatbot_user", "data_user", "admin"):
+        if has_permission("chat"):
             tab_index = 1
         with tabs[tab_index]:
             # Erstelle Untermenü mit zwei Optionen (ohne doppelten Titel)
@@ -2395,16 +2407,52 @@ async def main():
                     # Display initial table
                     table_placeholder.table(table_data)
 
+                    # Thread-safe progress tracking
+                    import threading
+                    import time
+                    from queue import Queue
+                    
+                    progress_lock = threading.Lock()
+                    progress_updates = Queue()
+                    last_ui_update = time.time()
+                    
+                    def update_table_row_safe(filename, progress, status):
+                        """Thread-safe table update function"""
+                        try:
+                            with progress_lock:
+                                for row in table_data:
+                                    if row["Dateiname"] == filename:
+                                        row["Fortschritt"] = progress
+                                        row["Status"] = status
+                                        break
+                                # Put update in queue for main thread
+                                progress_updates.put((filename, progress, status))
+                        except Exception as e:
+                            print(f"⚠️ Thread-safe update error for {filename}: {e}")
+                    
+                    def refresh_table_ui():
+                        """Refresh table UI in main thread"""
+                        nonlocal last_ui_update
+                        current_time = time.time()
+                        
+                        # Throttle UI updates to every 0.5 seconds
+                        if current_time - last_ui_update > 0.5:
+                            try:
+                                table_placeholder.table(table_data)
+                                last_ui_update = current_time
+                            except Exception as e:
+                                print(f"⚠️ UI refresh error: {e}")
+                    
                     # Process each NEW file (skip already processed ones)
                     for i, (uploaded_file, file_id) in enumerate(new_files):
-                        # Helper function to update table
+                        # Helper function to update table (thread-safe wrapper)
                         def update_table_row(filename, progress, status):
-                            for row in table_data:
-                                if row["Dateiname"] == filename:
-                                    row["Fortschritt"] = progress
-                                    row["Status"] = status
-                                    break
-                            table_placeholder.table(table_data)
+                            update_table_row_safe(filename, progress, status)
+                            # Try immediate UI update (works in main thread, fails silently in background)
+                            try:
+                                refresh_table_ui()
+                            except:
+                                pass
 
                         # Check file type first
                         file_ext = (
@@ -2662,12 +2710,39 @@ async def main():
                                     print(f"⚠️ Progress update error for {uploaded_file.name}: {e}")
                                     # Continue processing even if UI update fails
 
-                            result = await process_document(
-                                temp_file_path,
-                                safe_filename,
-                                metadata,  # ⇦ Jetzt mit erweiterten Metadaten
-                                on_phase=on_phase,
-                            )
+                            # Start periodic UI updates in background
+                            ui_update_task = None
+                            processing_active = threading.Event()
+                            processing_active.set()
+                            
+                            async def periodic_ui_updater():
+                                """Background task to update UI periodically"""
+                                while processing_active.is_set():
+                                    try:
+                                        await asyncio.sleep(1)  # Update every second
+                                        refresh_table_ui()
+                                    except Exception as e:
+                                        print(f"⚠️ Periodic UI update error: {e}")
+                                        
+                            # Start background UI updater
+                            ui_update_task = asyncio.create_task(periodic_ui_updater())
+                            
+                            try:
+                                result = await process_document(
+                                    temp_file_path,
+                                    safe_filename,
+                                    metadata,  # ⇦ Jetzt mit erweiterten Metadaten
+                                    on_phase=on_phase,
+                                )
+                            finally:
+                                # Stop background UI updates
+                                processing_active.clear()
+                                if ui_update_task:
+                                    ui_update_task.cancel()
+                                    try:
+                                        await ui_update_task
+                                    except asyncio.CancelledError:
+                                        pass
 
                             # Final status update
                             if result["success"]:
@@ -2751,9 +2826,9 @@ async def main():
 
 
     # Del-Tab (vorletzter Tab wenn verfügbar) 
-    if has_role("data_user", "admin"):
+    if has_permission("delete"):
         # Berechne Index: letzter Tab wenn nur delete, vorletzter wenn auch admin-Tab da ist
-        if has_role("admin"):
+        if get_user_role() == "admin":
             tab_index = len(tabs) - 2  # Vorletzter Tab (vor admin)
         else:
             tab_index = len(tabs) - 1  # Letzter Tab
@@ -2761,7 +2836,7 @@ async def main():
             await render_delete_preview_ui()
 
     # Benutzerverwaltungs-Tab (letzter Tab - nur für admin)
-    if has_role("admin"):
+    if get_user_role() == "admin":
         tab_index = len(tabs) - 1  # Letzter Tab
         with tabs[tab_index]:
             render_user_management()

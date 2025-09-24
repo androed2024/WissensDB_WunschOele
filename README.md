@@ -1,6 +1,8 @@
 
 ### **Konfiguration über Environment Variables**
 
+OCR for scanned pdf with unstructured library
+
 **Basic Configuration:**
 ```bash
 # API Keys
