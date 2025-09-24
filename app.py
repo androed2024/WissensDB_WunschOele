@@ -917,17 +917,427 @@ async def main():
     if "processed_files" not in st.session_state:
         st.session_state.processed_files = set()
 
-    tab1, tab2, tab3 = st.tabs(
-        [
-            "💬 Wunsch-Öle KI Assistent",
-            "➕ Wissen hinzufügen",
-            "🗑️ Dokument anzeigen / löschen",
-        ]
-    )
+    # ---- Rollenbasierte Tabs ----
+    tab_labels = []
+    
+    # Chat-Bereich (chatbot_user, data_user, admin)
+    if has_role("chatbot_user", "data_user", "admin"):
+        tab_labels.append("💬 Wunsch-Öle KI Assistent")
+    
+    # Wissen hinzufügen / Doku hochladen (data_user, admin)  
+    if has_role("data_user", "admin"):
+        tab_labels.append("➕ Wissen hinzufügen")
+    
+    # Dokumente anzeigen / löschen (data_user, admin)
+    if has_role("data_user", "admin"):
+        tab_labels.append("🗑️ Dokument anzeigen / löschen")
+    
+    if not tab_labels:
+        st.warning("Keine berechtigten Bereiche mit deinen Rollen.")
+        return
+        
+    tabs = st.tabs(tab_labels)
+    current_tab = 0
 
-    with tab1:
-        # Erstelle Untermenü mit zwei Optionen (ohne doppelten Titel)
-        chat_tab1, chat_tab2 = st.tabs(["Chat", "Chat Historie"])
+    async def render_delete_preview_ui():
+        """Renders the complete document/note preview and delete UI."""
+        # Custom CSS for better text readability in preview areas
+        st.markdown(
+        """
+        <style>
+        /* Improve readability of disabled text areas - use very light background and black text */
+        .stTextArea textarea[disabled] {
+            color: #000000 !important;
+            background-color: #f8f9fa !important;
+            opacity: 1 !important;
+            font-family: 'Source Code Pro', monospace !important;
+            line-height: 1.5 !important;
+            border: 1px solid #dee2e6 !important;
+            -webkit-text-fill-color: #000000 !important;
+        }
+        
+        /* Force black text color with higher specificity */
+        div[data-testid="stTextArea"] textarea[disabled] {
+            color: #000000 !important;
+            -webkit-text-fill-color: #000000 !important;
+        }
+        
+        /* Also apply to regular text areas for consistency */
+        .stTextArea textarea {
+            line-height: 1.5 !important;
+        }
+        </style>
+        """,
+            unsafe_allow_html=True,
+        )
+
+        # Zeige Vorschau nur wenn Benutzer die del-Berechtigung hat
+        if st.session_state.sources and has_role("data_user", "admin"):
+            delete_filename = st.selectbox(
+                "Dokument/Notiz selektieren", st.session_state.sources
+            )
+
+            # Vorschau anzeigen mit Button auf gleicher Höhe
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(
+                    "<h5 style='margin-top: 0rem; margin-bottom: 0.5rem;'>📄 Vorschau</h5>",
+                    unsafe_allow_html=True,
+                )
+            with col2:
+                delete_button_pressed = st.button(
+                    "🗑️ Ausgewähltes Dokument/Notiz löschen", key="delete_doc_button"
+                )
+
+            # Metadaten und Inhalt aus Supabase holen
+            try:
+                sb = get_sb_user()
+                res = (
+                    sb.table("rag_pages")
+                    .select("content", "metadata", "chunk_number")
+                    .eq("url", delete_filename)
+                    .order("chunk_number")  # Chunks in richtiger Reihenfolge
+                    .execute()
+                )
+
+                if res.data:
+                    # Für manuelle Notizen alle Chunks zusammensetzen
+                    first_entry = res.data[0]
+                    metadata = first_entry.get("metadata", {})
+                    source = metadata.get("source", "")
+                    
+                    if source == "manuell" and len(res.data) > 1:
+                        # Mehrere Chunks -> zusammensetzen (agentisch gechunkte Notiz)
+                        content_parts = []
+                        for entry in res.data:
+                            chunk_content = entry.get("content", "")
+                            if chunk_content.strip():
+                                content_parts.append(chunk_content.strip())
+                        
+                        # Chunks mit Zeilentrennung zusammenfügen
+                        content = "\n\n".join(content_parts)
+                        st.info(f"📄 Lange Notiz rekonstruiert aus {len(res.data)} agentisch erzeugten Chunks")
+                    else:
+                        # Einzelner Chunk oder andere Dokumente
+                        content = first_entry.get("content", "")
+
+                    if source == "manuell":
+                        # Put title and source side by side
+                        col1, col2 = st.columns([2, 1])
+                        with col1:
+                            st.markdown(
+                                f"**Titel:** {metadata.get('title', 'Unbekannt')}"
+                            )
+                        with col2:
+                            st.markdown(f"**Quelle:** {metadata.get('quelle', '–')}")
+
+                        # Use text_area with proper line breaks and scrolling like text files
+                        st.text_area(
+                            "Notizinhalt",
+                            content,
+                            height=400,
+                            disabled=True,
+                            key=f"note_preview_{hash(delete_filename)}",
+                        )
+                    else:
+                        # Unterscheidung zwischen PDF und TXT Dateien
+                        original_filename = metadata.get("original_filename", "")
+                        file_extension = metadata.get("file_extension", "").lower()
+
+                        # Fallback: Determine file extension from filename if not in metadata
+                        if not file_extension and original_filename:
+                            if "." in original_filename:
+                                file_extension = (
+                                    "." + original_filename.lower().split(".")[-1]
+                                )
+                            else:
+                                file_extension = ""
+
+                        if file_extension == ".pdf":
+                            # Original PDF anzeigen
+                            try:
+                                st.markdown("**📄 Original-PDF Vorschau:**")
+
+                                # Create signed URL dynamically for PDF preview
+                                client = get_supabase_client()
+                                try:
+                                    res = client.storage.from_(
+                                        "privatedocs"
+                                    ).create_signed_url(original_filename, 3600)
+                                    signed_url = res.get("signedURL")
+
+                                    if signed_url and signed_url != "#":
+                                        st.markdown("**PDF-Inhalt:**")
+
+                                        # Try multiple PDF viewer approaches for maximum compatibility
+
+                                        # Approach 1: Try Mozilla PDF.js viewer first (most reliable)
+                                        pdfjs_url = f"https://mozilla.github.io/pdf.js/web/viewer.html?file={signed_url}"
+
+                                        st_components.html(
+                                            f"""
+                                            <div style="width: 100%; height: 800px; border: 1px solid #ccc; border-radius: 6px; margin-top: 10px; position: relative;">
+                                                <iframe 
+                                                    src="{pdfjs_url}" 
+                                                    width="100%" 
+                                                    height="100%" 
+                                                    style="border: none; border-radius: 6px;"
+                                                    frameborder="0"
+                                                    onload="console.log('PDF.js loaded successfully')"
+                                                    onerror="console.error('PDF.js failed to load'); this.style.display='none'; document.getElementById('fallback-{hash(signed_url)}').style.display='block';">
+                                                </iframe>
+                                                
+                                                <!-- Fallback for when PDF.js doesn't work -->
+                                                <div id="fallback-{hash(signed_url)}" style="display: none; padding: 20px; text-align: center; height: 100%;">
+                                                    <div style="margin-top: 200px;">
+                                                        <h3>PDF-Vorschau nicht verfügbar</h3>
+                                                        <p>Der PDF-Viewer konnte nicht geladen werden.</p>
+                                                        <a href="{signed_url}" target="_blank" 
+                                                           style="display: inline-block; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; font-size: 16px;">
+                                                            📄 PDF in neuem Tab öffnen
+                                                        </a>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div style="position: absolute; bottom: 0; left: 0; right: 0; text-align: center; padding: 5px; background: rgba(248,249,250,0.9); border-top: 1px solid #dee2e6;">
+                                                    <small>
+                                                        <a href="{signed_url}" target="_blank" style="color: #007bff; text-decoration: none;">
+                                                            📄 PDF in neuem Tab öffnen
+                                                        </a>
+                                                    </small>
+                                                </div>
+                                            </div>
+                                            """,
+                                            height=820,
+                                        )
+                                    else:
+                                        st.warning(
+                                            "⚠️ PDF-Vorschau konnte nicht geladen werden. Signed URL nicht verfügbar."
+                                        )
+                                        st.info(f"Debug: Response: {res}")
+
+                                except Exception as url_error:
+                                    st.error(
+                                        f"❌ Fehler beim Erstellen der PDF-Vorschau URL: {url_error}"
+                                    )
+                                    st.info("Versuche alternative Anzeige...")
+
+                                    # Fallback: Show text content if available
+                                    if content and content.strip():
+                                        st.markdown("**Extrahierter Text-Inhalt:**")
+                                        st.text_area(
+                                            "PDF Textinhalt",
+                                            content,
+                                            height=400,
+                                            disabled=True,
+                                            key=f"pdf_text_preview_{hash(delete_filename)}",
+                                        )
+                                    else:
+                                        st.warning(
+                                            "Keine PDF-Vorschau oder Textinhalt verfügbar."
+                                        )
+
+                            except Exception as e:
+                                st.error(f"❌ Fehler beim Laden der PDF-Vorschau: {e}")
+                                # Show text content as fallback
+                                if content and content.strip():
+                                    st.markdown(
+                                        "**Extrahierter Text-Inhalt (Fallback):**"
+                                    )
+                                    st.text_area(
+                                        "PDF Textinhalt",
+                                        content,
+                                        height=400,
+                                        disabled=True,
+                                        key=f"pdf_fallback_preview_{hash(delete_filename)}",
+                                    )
+                        elif file_extension == ".txt":
+                            # TXT-Datei Vorschau
+                            try:
+                                st.markdown("**📄 Text-Datei Vorschau:**")
+                                # Put filename, file size and chunks on same line
+                                col1, col2, col3 = st.columns([2, 1, 1])
+                                with col1:
+                                    st.markdown(f"**Dateiname:** {original_filename}")
+                                with col2:
+                                    st.markdown(
+                                        f"**Dateigröße:** {metadata.get('file_size_bytes', 0)} Bytes"
+                                    )
+                                with col3:
+                                    st.markdown(
+                                        f"**Chunks:** {metadata.get('chunk_count', 1)}"
+                                    )
+
+                                st.text_area(
+                                    "Dateiinhalt",
+                                    content,
+                                    height=400,
+                                    disabled=True,
+                                    key=f"txt_preview_{hash(delete_filename)}",
+                                )
+                            except Exception as e:
+                                st.error(f"Fehler beim Laden der TXT-Vorschau: {e}")
+                        else:
+                            # Fallback für andere Dateitypen
+                            st.markdown(
+                                f"**📄 Dokument Vorschau ({original_filename}):**"
+                            )
+                            st.markdown(
+                                f"**Dateityp:** {file_extension if file_extension else 'Unbekannt'}"
+                            )
+                            st.markdown("**Inhalt:**")
+                            st.text_area(
+                                "Dokumentinhalt",
+                                content,
+                                height=400,
+                                disabled=True,
+                                key=f"doc_preview_{hash(delete_filename)}",
+                            )
+                else:
+                    st.info("Keine Vorschau verfügbar.")
+
+            except Exception as e:
+                st.error(f"Fehler beim Laden der Vorschau: {e}")
+
+            if delete_button_pressed:
+                st.write("Dateiname zur Löschung:", delete_filename)
+
+                storage_deleted = db_deleted = False
+
+                # Erst Datenbank, dann Storage löschen (umgekehrte Reihenfolge)
+                try:
+                    print(f"🗑️ Lösche Datenbankeinträge für: {delete_filename}")
+                    
+                    # Use User-Client for RLS compliance - only admins can delete
+                    sb = get_sb_user()
+                    delete_result = sb.table("rag_pages").delete().eq("url", delete_filename).execute()
+                    deleted_count = len(delete_result.data or [])
+                    
+                    st.code(
+                        f"🩨 SQL-Delete für '{delete_filename}' – {deleted_count} Einträge entfernt."
+                    )
+                    if deleted_count > 0:
+                        db_deleted = True
+                        print(
+                            f"✅ {deleted_count} Datenbankeinträge erfolgreich gelöscht"
+                        )
+                    else:
+                        print(
+                            f"⚠️ Keine Datenbankeinträge für {delete_filename} gefunden"
+                        )
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "403" in error_msg or "forbidden" in error_msg or "not allowed" in error_msg:
+                        st.error("❌ Löschung nicht erlaubt. Nur Administratoren können Dokumente löschen.")
+                        print(f"🚫 RLS-Blockierung: Benutzer hat keine Löschberechtigung für {delete_filename}")
+                    else:
+                        st.error(f"Datenbank-Löschung fehlgeschlagen: {e}")
+                        print(f"❌ Datenbank-Löschung fehlgeschlagen: {e}")
+                    db_deleted = False
+
+                try:
+                    print(f"🗑️ Lösche Storage-Datei: {delete_filename}")
+                    # Use User-Client for RLS compliance - storage policies also apply
+                    sb = get_sb_user()
+                    sb.storage.from_("privatedocs").remove(
+                        [delete_filename]
+                    )
+                    storage_deleted = True
+                    print(f"✅ Storage-Datei erfolgreich gelöscht")
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "403" in error_msg or "forbidden" in error_msg or "not allowed" in error_msg:
+                        st.error("❌ Storage-Löschung nicht erlaubt. Nur Administratoren können Dateien aus dem Speicher löschen.")
+                        print(f"🚫 RLS-Blockierung: Benutzer hat keine Storage-Löschberechtigung für {delete_filename}")
+                    else:
+                        st.error(f"Löschen aus dem Speicher fehlgeschlagen: {e}")
+                        print(f"❌ Storage-Löschung fehlgeschlagen: {e}")
+
+                # Zusätzliche Verifikation: Prüfe ob wirklich gelöscht
+                try:
+                    print(
+                        f"🔍 Verifikation: Prüfe ob {delete_filename} wirklich gelöscht wurde..."
+                    )
+                    sb = get_sb_user()
+                    verify_result = (
+                        sb.table("rag_pages")
+                        .select("id,url")
+                        .eq("url", delete_filename)
+                        .execute()
+                    )
+                    remaining_entries = len(verify_result.data or [])
+                    if remaining_entries > 0:
+                        print(
+                            f"⚠️ WARNUNG: {remaining_entries} Einträge für {delete_filename} sind noch in der Datenbank!"
+                        )
+                        st.warning(
+                            f"⚠️ {remaining_entries} Einträge sind noch in der Datenbank vorhanden!"
+                        )
+                        # Versuche nochmal zu löschen
+                        print("🔄 Versuche erneute Löschung...")
+                        retry_deleted = supabase_client.delete_documents_by_filename(
+                            delete_filename
+                        )
+                        print(
+                            f"🔄 Zweiter Löschversuch: {retry_deleted} Einträge entfernt"
+                        )
+                    else:
+                        print(
+                            f"✅ Verifikation erfolgreich: Keine Einträge für {delete_filename} gefunden"
+                        )
+                except Exception as e:
+                    print(f"❌ Verifikation fehlgeschlagen: {e}")
+                    st.error(f"Verifikation fehlgeschlagen: {e}")
+
+                if storage_deleted and db_deleted:
+                    st.success("✅ Vollständig gelöscht.")
+                    # Remove from processed files list so it can be re-uploaded
+                    if "processed_files" in st.session_state:
+                        # Remove all entries that match this filename
+                        files_to_remove = [
+                            f
+                            for f in st.session_state.processed_files
+                            if delete_filename in f
+                        ]
+                        for file_to_remove in files_to_remove:
+                            st.session_state.processed_files.discard(file_to_remove)
+                            print(f"🧹 Entfernt aus processed_files: {file_to_remove}")
+                elif storage_deleted and not db_deleted:
+                    st.warning(
+                        "⚠️ Dokument/Notiz im Storage gelöscht, aber kein Eintrag in der Datenbank gefunden."
+                    )
+                elif not storage_deleted and db_deleted:
+                    st.warning(
+                        "⚠️ Datenbankeinträge gelöscht, aber Dokument/Notiz im Storage konnte nicht entfernt werden."
+                    )
+                else:
+                    st.error(
+                        "❌ Weder Dokument/Notiz noch Datenbankeinträge konnten gelöscht werden."
+                    )
+
+                # Cache leeren und Quellen aktualisieren
+                print("🔄 Aktualisiere verfügbare Quellen nach Löschung...")
+                await update_available_sources()
+
+                # Zusätzlich: Session State Cache leeren
+                cache_keys_to_clear = ["sources", "document_count", "knowledge_count"]
+                for key in cache_keys_to_clear:
+                    if key in st.session_state:
+                        old_value = st.session_state[key]
+                        del st.session_state[key]
+                        print(f"🧹 Cache geleert: {key} (war: {old_value})")
+
+                print("🔄 Seite wird neu geladen...")
+                st.rerun()
+
+        else:
+            st.info("Keine Dokumente/Notizen zur Löschung verfügbar.")
+
+    # Chat-Tab (immer der erste verfügbare Tab für berechtigte Benutzer)
+    if has_role("chatbot_user", "data_user", "admin"):
+        with tabs[current_tab]:
+            # Erstelle Untermenü mit zwei Optionen (ohne doppelten Titel)
+            chat_tab1, chat_tab2 = st.tabs(["Chat", "Chat Historie"])
 
         with chat_tab1:
             # Vereinfachtes Layout ohne feste Header
@@ -1392,11 +1802,16 @@ async def main():
             # Chat Historie implementiert
             render_chat_history()
 
-    with tab2:
-        # Erstelle Untermenü mit zwei Optionen (ohne doppelten Titel)
-        knowledge_tab1, knowledge_tab2 = st.tabs(
-            ["Notiz hinzufügen", "Dokumente hochladen"]
-        )
+    # Add-Tab (zweiter Tab wenn verfügbar)
+    if has_role("data_user", "admin"):
+        tab_index = 0
+        if has_role("chatbot_user", "data_user", "admin"):
+            tab_index = 1
+        with tabs[tab_index]:
+            # Erstelle Untermenü mit zwei Optionen (ohne doppelten Titel)
+            knowledge_tab1, knowledge_tab2 = st.tabs(
+                ["Notiz hinzufügen", "Dokumente hochladen"]
+            )
 
         with knowledge_tab1:
             st.markdown(
@@ -2104,398 +2519,12 @@ async def main():
                 unsafe_allow_html=True,
             )
 
-    with tab3:
 
-        # Custom CSS for better text readability in preview areas
-        st.markdown(
-            """
-        <style>
-        /* Improve readability of disabled text areas - use very light background and black text */
-        .stTextArea textarea[disabled] {
-            color: #000000 !important;
-            background-color: #f8f9fa !important;
-            opacity: 1 !important;
-            font-family: 'Source Code Pro', monospace !important;
-            line-height: 1.5 !important;
-            border: 1px solid #dee2e6 !important;
-            -webkit-text-fill-color: #000000 !important;
-        }
-        
-        /* Force black text color with higher specificity */
-        div[data-testid="stTextArea"] textarea[disabled] {
-            color: #000000 !important;
-            -webkit-text-fill-color: #000000 !important;
-        }
-        
-        /* Also apply to regular text areas for consistency */
-        .stTextArea textarea {
-            line-height: 1.5 !important;
-        }
-        </style>
-        """,
-            unsafe_allow_html=True,
-        )
-
-        if st.session_state.sources:
-            delete_filename = st.selectbox(
-                "Dokument/Notiz selektieren", st.session_state.sources
-            )
-
-            # Vorschau anzeigen mit Button auf gleicher Höhe
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.markdown(
-                    "<h5 style='margin-top: 0rem; margin-bottom: 0.5rem;'>📄 Vorschau</h5>",
-                    unsafe_allow_html=True,
-                )
-            with col2:
-                delete_button_pressed = st.button(
-                    "🗑️ Ausgewähltes Dokument/Notiz löschen", key="delete_doc_button"
-                )
-
-            # Metadaten und Inhalt aus Supabase holen
-            try:
-                sb = get_sb_user()
-                res = (
-                    sb.table("rag_pages")
-                    .select("content", "metadata", "chunk_number")
-                    .eq("url", delete_filename)
-                    .order("chunk_number")  # Chunks in richtiger Reihenfolge
-                    .execute()
-                )
-
-                if res.data:
-                    # Für manuelle Notizen alle Chunks zusammensetzen
-                    first_entry = res.data[0]
-                    metadata = first_entry.get("metadata", {})
-                    source = metadata.get("source", "")
-                    
-                    if source == "manuell" and len(res.data) > 1:
-                        # Mehrere Chunks -> zusammensetzen (agentisch gechunkte Notiz)
-                        content_parts = []
-                        for entry in res.data:
-                            chunk_content = entry.get("content", "")
-                            if chunk_content.strip():
-                                content_parts.append(chunk_content.strip())
-                        
-                        # Chunks mit Zeilentrennung zusammenfügen
-                        content = "\n\n".join(content_parts)
-                        st.info(f"📄 Lange Notiz rekonstruiert aus {len(res.data)} agentisch erzeugten Chunks")
-                    else:
-                        # Einzelner Chunk oder andere Dokumente
-                        content = first_entry.get("content", "")
-
-                    if source == "manuell":
-                        # Put title and source side by side
-                        col1, col2 = st.columns([2, 1])
-                        with col1:
-                            st.markdown(
-                                f"**Titel:** {metadata.get('title', 'Unbekannt')}"
-                            )
-                        with col2:
-                            st.markdown(f"**Quelle:** {metadata.get('quelle', '–')}")
-
-                        # Use text_area with proper line breaks and scrolling like text files
-                        st.text_area(
-                            "Notizinhalt",
-                            content,
-                            height=400,
-                            disabled=True,
-                            key=f"note_preview_{hash(delete_filename)}",
-                        )
-                    else:
-                        # Unterscheidung zwischen PDF und TXT Dateien
-                        original_filename = metadata.get("original_filename", "")
-                        file_extension = metadata.get("file_extension", "").lower()
-
-                        # Fallback: Determine file extension from filename if not in metadata
-                        if not file_extension and original_filename:
-                            if "." in original_filename:
-                                file_extension = (
-                                    "." + original_filename.lower().split(".")[-1]
-                                )
-                            else:
-                                file_extension = ""
-
-                        if file_extension == ".pdf":
-                            # Original PDF anzeigen
-                            try:
-                                st.markdown("**📄 Original-PDF Vorschau:**")
-
-                                # Create signed URL dynamically for PDF preview
-                                client = get_supabase_client()
-                                try:
-                                    res = client.storage.from_(
-                                        "privatedocs"
-                                    ).create_signed_url(original_filename, 3600)
-                                    signed_url = res.get("signedURL")
-
-                                    if signed_url and signed_url != "#":
-                                        st.markdown("**PDF-Inhalt:**")
-
-                                        # Try multiple PDF viewer approaches for maximum compatibility
-
-                                        # Approach 1: Try Mozilla PDF.js viewer first (most reliable)
-                                        pdfjs_url = f"https://mozilla.github.io/pdf.js/web/viewer.html?file={signed_url}"
-
-                                        st_components.html(
-                                            f"""
-                                            <div style="width: 100%; height: 800px; border: 1px solid #ccc; border-radius: 6px; margin-top: 10px; position: relative;">
-                                                <iframe 
-                                                    src="{pdfjs_url}" 
-                                                    width="100%" 
-                                                    height="100%" 
-                                                    style="border: none; border-radius: 6px;"
-                                                    frameborder="0"
-                                                    onload="console.log('PDF.js loaded successfully')"
-                                                    onerror="console.error('PDF.js failed to load'); this.style.display='none'; document.getElementById('fallback-{hash(signed_url)}').style.display='block';">
-                                                </iframe>
-                                                
-                                                <!-- Fallback for when PDF.js doesn't work -->
-                                                <div id="fallback-{hash(signed_url)}" style="display: none; padding: 20px; text-align: center; height: 100%;">
-                                                    <div style="margin-top: 200px;">
-                                                        <h3>PDF-Vorschau nicht verfügbar</h3>
-                                                        <p>Der PDF-Viewer konnte nicht geladen werden.</p>
-                                                        <a href="{signed_url}" target="_blank" 
-                                                           style="display: inline-block; padding: 10px 20px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; font-size: 16px;">
-                                                            📄 PDF in neuem Tab öffnen
-                                                        </a>
-                                                    </div>
-                                                </div>
-                                                
-                                                <div style="position: absolute; bottom: 0; left: 0; right: 0; text-align: center; padding: 5px; background: rgba(248,249,250,0.9); border-top: 1px solid #dee2e6;">
-                                                    <small>
-                                                        <a href="{signed_url}" target="_blank" style="color: #007bff; text-decoration: none;">
-                                                            📄 PDF in neuem Tab öffnen
-                                                        </a>
-                                                    </small>
-                                                </div>
-                                            </div>
-                                            """,
-                                            height=820,
-                                        )
-                                    else:
-                                        st.warning(
-                                            "⚠️ PDF-Vorschau konnte nicht geladen werden. Signed URL nicht verfügbar."
-                                        )
-                                        st.info(f"Debug: Response: {res}")
-
-                                except Exception as url_error:
-                                    st.error(
-                                        f"❌ Fehler beim Erstellen der PDF-Vorschau URL: {url_error}"
-                                    )
-                                    st.info("Versuche alternative Anzeige...")
-
-                                    # Fallback: Show text content if available
-                                    if content and content.strip():
-                                        st.markdown("**Extrahierter Text-Inhalt:**")
-                                        st.text_area(
-                                            "PDF Textinhalt",
-                                            content,
-                                            height=400,
-                                            disabled=True,
-                                            key=f"pdf_text_preview_{hash(delete_filename)}",
-                                        )
-                                    else:
-                                        st.warning(
-                                            "Keine PDF-Vorschau oder Textinhalt verfügbar."
-                                        )
-
-                            except Exception as e:
-                                st.error(f"❌ Fehler beim Laden der PDF-Vorschau: {e}")
-                                # Show text content as fallback
-                                if content and content.strip():
-                                    st.markdown(
-                                        "**Extrahierter Text-Inhalt (Fallback):**"
-                                    )
-                                    st.text_area(
-                                        "PDF Textinhalt",
-                                        content,
-                                        height=400,
-                                        disabled=True,
-                                        key=f"pdf_fallback_preview_{hash(delete_filename)}",
-                                    )
-                        elif file_extension == ".txt":
-                            # TXT-Datei Vorschau
-                            try:
-                                st.markdown("**📄 Text-Datei Vorschau:**")
-                                # Put filename, file size and chunks on same line
-                                col1, col2, col3 = st.columns([2, 1, 1])
-                                with col1:
-                                    st.markdown(f"**Dateiname:** {original_filename}")
-                                with col2:
-                                    st.markdown(
-                                        f"**Dateigröße:** {metadata.get('file_size_bytes', 0)} Bytes"
-                                    )
-                                with col3:
-                                    st.markdown(
-                                        f"**Chunks:** {metadata.get('chunk_count', 1)}"
-                                    )
-
-                                st.text_area(
-                                    "Dateiinhalt",
-                                    content,
-                                    height=400,
-                                    disabled=True,
-                                    key=f"txt_preview_{hash(delete_filename)}",
-                                )
-                            except Exception as e:
-                                st.error(f"Fehler beim Laden der TXT-Vorschau: {e}")
-                        else:
-                            # Fallback für andere Dateitypen
-                            st.markdown(
-                                f"**📄 Dokument Vorschau ({original_filename}):**"
-                            )
-                            st.markdown(
-                                f"**Dateityp:** {file_extension if file_extension else 'Unbekannt'}"
-                            )
-                            st.markdown("**Inhalt:**")
-                            st.text_area(
-                                "Dokumentinhalt",
-                                content,
-                                height=400,
-                                disabled=True,
-                                key=f"doc_preview_{hash(delete_filename)}",
-                            )
-                else:
-                    st.info("Keine Vorschau verfügbar.")
-
-            except Exception as e:
-                st.error(f"Fehler beim Laden der Vorschau: {e}")
-
-            if delete_button_pressed:
-                st.write("Dateiname zur Löschung:", delete_filename)
-
-                storage_deleted = db_deleted = False
-
-                # Erst Datenbank, dann Storage löschen (umgekehrte Reihenfolge)
-                try:
-                    print(f"🗑️ Lösche Datenbankeinträge für: {delete_filename}")
-                    
-                    # Use User-Client for RLS compliance - only admins can delete
-                    sb = get_sb_user()
-                    delete_result = sb.table("rag_pages").delete().eq("url", delete_filename).execute()
-                    deleted_count = len(delete_result.data or [])
-                    
-                    st.code(
-                        f"🩨 SQL-Delete für '{delete_filename}' – {deleted_count} Einträge entfernt."
-                    )
-                    if deleted_count > 0:
-                        db_deleted = True
-                        print(
-                            f"✅ {deleted_count} Datenbankeinträge erfolgreich gelöscht"
-                        )
-                    else:
-                        print(
-                            f"⚠️ Keine Datenbankeinträge für {delete_filename} gefunden"
-                        )
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if "403" in error_msg or "forbidden" in error_msg or "not allowed" in error_msg:
-                        st.error("❌ Löschung nicht erlaubt. Nur Administratoren können Dokumente löschen.")
-                        print(f"🚫 RLS-Blockierung: Benutzer hat keine Löschberechtigung für {delete_filename}")
-                    else:
-                        st.error(f"Datenbank-Löschung fehlgeschlagen: {e}")
-                        print(f"❌ Datenbank-Löschung fehlgeschlagen: {e}")
-                    db_deleted = False
-
-                try:
-                    print(f"🗑️ Lösche Storage-Datei: {delete_filename}")
-                    # Use User-Client for RLS compliance - storage policies also apply
-                    sb = get_sb_user()
-                    sb.storage.from_("privatedocs").remove(
-                        [delete_filename]
-                    )
-                    storage_deleted = True
-                    print(f"✅ Storage-Datei erfolgreich gelöscht")
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if "403" in error_msg or "forbidden" in error_msg or "not allowed" in error_msg:
-                        st.error("❌ Storage-Löschung nicht erlaubt. Nur Administratoren können Dateien aus dem Speicher löschen.")
-                        print(f"🚫 RLS-Blockierung: Benutzer hat keine Storage-Löschberechtigung für {delete_filename}")
-                    else:
-                        st.error(f"Löschen aus dem Speicher fehlgeschlagen: {e}")
-                        print(f"❌ Storage-Löschung fehlgeschlagen: {e}")
-
-                # Zusätzliche Verifikation: Prüfe ob wirklich gelöscht
-                try:
-                    print(
-                        f"🔍 Verifikation: Prüfe ob {delete_filename} wirklich gelöscht wurde..."
-                    )
-                    sb = get_sb_user()
-                    verify_result = (
-                        sb.table("rag_pages")
-                        .select("id,url")
-                        .eq("url", delete_filename)
-                        .execute()
-                    )
-                    remaining_entries = len(verify_result.data or [])
-                    if remaining_entries > 0:
-                        print(
-                            f"⚠️ WARNUNG: {remaining_entries} Einträge für {delete_filename} sind noch in der Datenbank!"
-                        )
-                        st.warning(
-                            f"⚠️ {remaining_entries} Einträge sind noch in der Datenbank vorhanden!"
-                        )
-                        # Versuche nochmal zu löschen
-                        print("🔄 Versuche erneute Löschung...")
-                        retry_deleted = supabase_client.delete_documents_by_filename(
-                            delete_filename
-                        )
-                        print(
-                            f"🔄 Zweiter Löschversuch: {retry_deleted} Einträge entfernt"
-                        )
-                    else:
-                        print(
-                            f"✅ Verifikation erfolgreich: Keine Einträge für {delete_filename} gefunden"
-                        )
-                except Exception as e:
-                    print(f"❌ Verifikation fehlgeschlagen: {e}")
-                    st.error(f"Verifikation fehlgeschlagen: {e}")
-
-                if storage_deleted and db_deleted:
-                    st.success("✅ Vollständig gelöscht.")
-                    # Remove from processed files list so it can be re-uploaded
-                    if "processed_files" in st.session_state:
-                        # Remove all entries that match this filename
-                        files_to_remove = [
-                            f
-                            for f in st.session_state.processed_files
-                            if delete_filename in f
-                        ]
-                        for file_to_remove in files_to_remove:
-                            st.session_state.processed_files.discard(file_to_remove)
-                            print(f"🧹 Entfernt aus processed_files: {file_to_remove}")
-                elif storage_deleted and not db_deleted:
-                    st.warning(
-                        "⚠️ Dokument/Notiz im Storage gelöscht, aber kein Eintrag in der Datenbank gefunden."
-                    )
-                elif not storage_deleted and db_deleted:
-                    st.warning(
-                        "⚠️ Datenbankeinträge gelöscht, aber Dokument/Notiz im Storage konnte nicht entfernt werden."
-                    )
-                else:
-                    st.error(
-                        "❌ Weder Dokument/Notiz noch Datenbankeinträge konnten gelöscht werden."
-                    )
-
-                # Cache leeren und Quellen aktualisieren
-                print("🔄 Aktualisiere verfügbare Quellen nach Löschung...")
-                await update_available_sources()
-
-                # Zusätzlich: Session State Cache leeren
-                cache_keys_to_clear = ["sources", "document_count", "knowledge_count"]
-                for key in cache_keys_to_clear:
-                    if key in st.session_state:
-                        old_value = st.session_state[key]
-                        del st.session_state[key]
-                        print(f"🧹 Cache geleert: {key} (war: {old_value})")
-
-                print("🔄 Seite wird neu geladen...")
-                st.rerun()
-
-        else:
-            st.info("Keine Dokumente/Notizen zur Löschung verfügbar.")
+    # Del-Tab (letzter Tab wenn verfügbar) 
+    if has_role("data_user", "admin"):
+        tab_index = len(tabs) - 1  # Letzter Tab
+        with tabs[tab_index]:
+            await render_delete_preview_ui()
 
 
 if __name__ == "__main__":

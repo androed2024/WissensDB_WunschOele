@@ -584,7 +584,7 @@ class DocumentIngestionPipeline:
             # Clamp confidence
             confidence = _clamp01(confidence)
                 
-            supabase.store_document_chunk(
+            self.supabase_client.store_document_chunk(
                 url=url,
                 chunk_number=i,
                 content=chunk["text"],
