@@ -64,7 +64,6 @@ try:
 except Exception:
     AGGRID = False
 
-
 def sanitize_filename(filename: str) -> str:
     filename = filename.strip()
     filename = filename.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
@@ -99,6 +98,9 @@ SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
 
 # Auth-Client (für Login/Passwort ändern)
 sb_auth = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# Admin-Client (Service Role für Benutzerverwaltung - nur serverseitig verwenden!)
+SB_ADMIN = create_client(SUPABASE_URL, os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
 
 app_version = os.getenv("APP_VERSION", "0.0")
@@ -211,15 +213,15 @@ def render_header():
 
 supabase_client = SupabaseClient()
 
-# Agent instances will be created with User-Client when needed
+# Agent instances will be created with appropriate client (Service for admin, User for others)
 def get_agentic_orchestrator():
-    """Get AgenticRetrievalOrchestrator with User-Client."""
-    sb = get_sb_user()
+    """Get AgenticRetrievalOrchestrator with appropriate client for user role."""
+    sb = get_db_client_for_admin_operations()
     return AgenticRetrievalOrchestrator(db_client=sb)
 
 def get_rag_agent():
-    """Get RAGAgent with User-Client."""
-    sb = get_sb_user()
+    """Get RAGAgent with appropriate client for user role."""
+    sb = get_db_client_for_admin_operations()
     return RAGAgent(db_client=sb)
 
 async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig) -> Dict[str, Any]:
@@ -305,6 +307,17 @@ def get_sb_user():
     """Hole den User-Client (mit JWT)."""
     return st.session_state.get("sb_user")
 
+def get_db_client_for_admin_operations():
+    """
+    Hole den passenden DB-Client für Admin-Operationen.
+    Admins bekommen Service-Client für uneingeschränkten Zugriff,
+    normale User bekommen User-Client mit RLS.
+    """
+    if has_role("admin"):
+        return SB_ADMIN  # Service-Client für Admins
+    else:
+        return get_sb_user()  # User-Client für normale User
+
 def has_role(*wanted):
     roles = st.session_state.get("roles", []) or []
     return ("admin" in roles) or any(r in roles for r in wanted)
@@ -332,6 +345,85 @@ def user_menu():
             for k in ("session","user","roles","sb_user"):
                 st.session_state.pop(k, None)
             st.rerun()
+
+
+# ==== Admin-Funktionen für Benutzerverwaltung ====
+
+def list_users():
+    """Liste aller Benutzer mit Rollen abrufen."""
+    try:
+        result = SB_ADMIN.auth.admin.list_users()
+        users = []
+        for user in result:
+            roles = user.app_metadata.get("roles", []) if user.app_metadata else []
+            users.append({
+                "id": user.id,
+                "email": user.email,
+                "roles": roles
+            })
+        return users
+    except Exception as e:
+        st.error(f"Fehler beim Laden der Benutzer: {e}")
+        return []
+
+def set_roles(uid: str, roles: list):
+    """Rollen für einen Benutzer setzen."""
+    try:
+        SB_ADMIN.auth.admin.update_user_by_id(uid, {"app_metadata": {"roles": roles}})
+        return True
+    except Exception as e:
+        st.error(f"Fehler beim Setzen der Rollen: {e}")
+        return False
+
+def create_user(email: str, roles: list, password: str = None):
+    """Neuen Benutzer erstellen."""
+    try:
+        user_data = {
+            "email": email,
+            "email_confirm": True,
+            "app_metadata": {"roles": roles}
+        }
+        
+        if password:
+            user_data["password"] = password
+            result = SB_ADMIN.auth.admin.create_user(user_data)
+            st.success("Benutzer angelegt, kann sich sofort anmelden.")
+        else:
+            result = SB_ADMIN.auth.admin.create_user(user_data)
+            # Recovery-Mail senden
+            sb_auth.auth.reset_password_for_email(
+                email, 
+                options={"redirect_to": os.environ.get("APP_BASE_URL", "http://localhost:8501/")}
+            )
+            st.success("Benutzer angelegt. Recovery-Mail gesendet.")
+        return True
+    except Exception as e:
+        st.error(f"Fehler beim Erstellen des Benutzers: {e}")
+        return False
+
+def delete_user(uid: str):
+    """Benutzer löschen."""
+    try:
+        SB_ADMIN.auth.admin.delete_user(uid)
+        return True
+    except Exception as e:
+        st.error(f"Fehler beim Löschen des Benutzers: {e}")
+        return False
+
+def send_recovery(email: str):
+    """Recovery-Mail senden."""
+    try:
+        sb_auth.auth.reset_password_for_email(
+            email, 
+            options={"redirect_to": os.environ.get("APP_BASE_URL", "http://localhost:8501/")}
+        )
+        st.success("Recovery-Mail gesendet.")
+        return True
+    except Exception as e:
+        st.error(f"Fehler beim Senden der Recovery-Mail: {e}")
+        return False
+
+# ==== Ende Admin-Funktionen ====
 
 
 def render_agentic_config_sidebar():
@@ -500,8 +592,8 @@ async def process_document(
     Returns:
         Dict mit success, chunk_count und ggf. error
     """
-    # Use User-Client for RLS compliance
-    sb = get_sb_user()
+    # Use appropriate client (Service for admin, User for others)
+    sb = get_db_client_for_admin_operations()
     pipeline = DocumentIngestionPipeline(db_client=sb)
     loop = asyncio.get_event_loop()
 
@@ -570,21 +662,13 @@ async def process_document(
         return {"success": False, "file_path": file_path, "error": str(e)}
 
 
-async def run_agent_with_streaming(user_input: str):
+async def run_agent_with_streaming(user_input: str, rag_agent_instance):
     # Log der Original-Frage vom User
     print(f"\n🔵 [USER INPUT] Original-Frage: {user_input}")
 
-    # Get User-Client RAG agent
-    user_rag_agent = get_rag_agent()
-    
-    # Reset akkumulierte Treffer für neue Frage (aber nicht None setzen!)
-    if hasattr(user_rag_agent, "last_match"):
-        user_rag_agent.last_match = []
-        print(f"🔄 Reset: Treffer-Akkumulator für neue Frage geleert")
-
-    async with user_rag_agent.agent.iter(
+    async with rag_agent_instance.agent.iter(
         user_input,
-        deps={"kb_search": user_rag_agent.kb_search},
+        deps={"kb_search": rag_agent_instance.kb_search},
         message_history=st.session_state.messages,
     ) as run:
         async for node in run:
@@ -607,7 +691,8 @@ async def run_agent_with_streaming(user_input: str):
 def get_chat_history(search_term: str = "") -> List[Dict]:
     """Holt Chat-Historie aus Supabase mit optionaler Wildcard-Suche"""
     try:
-        sb = get_sb_user()
+        # Für Admins Service-Client verwenden, für normale User RLS-Client
+        sb = get_db_client_for_admin_operations()
         query = sb.table("chat_history").select("*")
 
         if search_term.strip():
@@ -651,27 +736,21 @@ def render_chat_history():
     """Suche oben, klickbare Tabelle links (AgGrid) und Details rechts."""
 
     # ── Suche ──────────────────────────────────────────────────────────────────────
-    top1, top2 = st.columns([4, 1])
-    with top1:
-        search_term = st.text_input(
-            "🔎 Suche in Fragen (Wildcard-Suche)",
-            value=st.session_state.get("chat_history_search", ""),
-            key="chat_history_search_input",
-        )
-    with top2:
-        st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
-        if st.button("Suchen", key="chat_history_search_btn", use_container_width=True):
-            st.session_state.chat_history_search = search_term.strip()
-            st.session_state.selected_chat_id = None
-            print("[CHAT] Search submitted → rerun")
-            st.rerun()
+    search_term = st.text_input(
+        "🔎 Suche in Fragen (Wildcard-Suche)",
+        value="",
+        placeholder="Geben Sie Suchbegriff ein...",
+        key="chat_history_search_input",
+        help="Die Suche erfolgt automatisch während der Eingabe"
+    )
 
     # ── Daten ─────────────────────────────────────────────────────────────────────
-    chat_history = get_chat_history(st.session_state.get("chat_history_search", ""))
+    # Live-Suche: Verwende den aktuellen search_term direkt
+    chat_history = get_chat_history(search_term.strip())
     if not chat_history:
         st.info(
-            f"Keine Chats gefunden für: '{st.session_state.get('chat_history_search','')}'"
-            if st.session_state.get("chat_history_search")
+            f"Keine Chats gefunden für: '{search_term.strip()}'"
+            if search_term.strip()
             else "Keine Chat-Historie verfügbar."
         )
         return
@@ -679,8 +758,15 @@ def render_chat_history():
     chat_df = _chat_history_df(chat_history)  # id, Datum, Frage
     grid_df = chat_df[["Datum", "Frage", "id"]].reset_index(drop=True)
 
-    # Erstinitialisierung der Auswahl
-    if not st.session_state.get("selected_chat_id") and len(grid_df) > 0:
+    # Auswahl-Management: Reset bei Suche oder Initialisierung
+    current_selected_id = st.session_state.get("selected_chat_id")
+    available_ids = set(grid_df["id"].tolist()) if len(grid_df) > 0 else set()
+    
+    # Reset selection wenn aktuelle ID nicht in gefilterten Ergebnissen ist
+    if current_selected_id not in available_ids and len(grid_df) > 0:
+        st.session_state.selected_chat_id = grid_df.loc[0, "id"]
+        print(f"[CHAT] reset selected_chat_id -> {st.session_state.selected_chat_id} (search filter changed)")
+    elif not current_selected_id and len(grid_df) > 0:
         st.session_state.selected_chat_id = grid_df.loc[0, "id"]
         print(f"[CHAT] init selected_chat_id -> {st.session_state.selected_chat_id}")
 
@@ -736,7 +822,7 @@ def render_chat_history():
                 rememberSelection=True,
             )
 
-            grid_key = f"chat_history_grid_v5_{len(grid_df)}_{st.session_state.get('chat_history_search','').strip()}"
+            grid_key = f"chat_history_grid_v5_{len(grid_df)}_{search_term.strip()}"
 
             # Neu: update_on (neue API)  → Fallback: update_mode (alte API)
             try:
@@ -844,8 +930,8 @@ async def update_available_sources():
     try:
         # response = (supabase_client.client.table("rag_pages").select("url, metadata").execute()
 
-        # neu (RLS greift):
-        sb = get_sb_user()
+        # neu (Service-Client für Admin, RLS für User):
+        sb = get_db_client_for_admin_operations()
         response = sb.table("rag_pages").select("url, metadata").execute()
 
 
@@ -932,12 +1018,120 @@ async def main():
     if has_role("data_user", "admin"):
         tab_labels.append("🗑️ Dokument anzeigen / löschen")
     
+    # Benutzerverwaltung (nur admin)
+    if has_role("admin"):
+        tab_labels.append("👤 Benutzerverwaltung")
+    
     if not tab_labels:
         st.warning("Keine berechtigten Bereiche mit deinen Rollen.")
         return
         
     tabs = st.tabs(tab_labels)
     current_tab = 0
+
+    def render_user_management():
+        """Renders the user management UI for admins."""
+        st.markdown("### 👤 Benutzerverwaltung")
+        st.markdown("---")
+        
+        # Neuen Benutzer anlegen
+        st.markdown("#### ➕ Neuen Benutzer anlegen")
+        with st.container():
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                new_email = st.text_input("E-Mail-Adresse", key="new_user_email")
+                new_password = st.text_input("Passwort (optional - wenn leer, wird Recovery-Mail gesendet)", 
+                                           type="password", key="new_user_password")
+            
+            with col2:
+                st.markdown("**Rollen:**")
+                role_admin = st.checkbox("admin", key="new_user_admin")
+                role_data = st.checkbox("data_user", key="new_user_data")
+                role_chat = st.checkbox("chatbot_user", key="new_user_chat")
+            
+            if st.button("Benutzer anlegen", type="primary"):
+                if new_email.strip():
+                    roles = []
+                    if role_admin: roles.append("admin")
+                    if role_data: roles.append("data_user") 
+                    if role_chat: roles.append("chatbot_user")
+                    
+                    if roles:
+                        password = new_password.strip() if new_password.strip() else None
+                        if create_user(new_email.strip(), roles, password):
+                            st.rerun()
+                    else:
+                        st.error("Mindestens eine Rolle muss ausgewählt werden.")
+                else:
+                    st.error("E-Mail-Adresse ist erforderlich.")
+        
+        st.markdown("---")
+        
+        # Bestehende Benutzer verwalten
+        st.markdown("#### 👥 Bestehende Benutzer verwalten")
+        
+        users = list_users()
+        if users:
+            for user in users:
+                with st.container():
+                    col1, col2, col3 = st.columns([2, 3, 2])
+                    
+                    with col1:
+                        st.markdown(f"**{user['email']}**")
+                        st.caption(f"ID: {user['id'][:8]}...")
+                    
+                    with col2:
+                        st.markdown("**Rollen:**")
+                        user_roles = user.get('roles', [])
+                        
+                        # Checkboxen für Rollen (unique keys mit user_id)
+                        admin_checked = st.checkbox("admin", 
+                                                  value="admin" in user_roles,
+                                                  key=f"admin_{user['id']}")
+                        data_checked = st.checkbox("data_user", 
+                                                 value="data_user" in user_roles,
+                                                 key=f"data_{user['id']}")
+                        chat_checked = st.checkbox("chatbot_user", 
+                                                 value="chatbot_user" in user_roles,
+                                                 key=f"chat_{user['id']}")
+                    
+                    with col3:
+                        # Action Buttons
+                        if st.button("💾 Rollen speichern", key=f"save_{user['id']}"):
+                            new_roles = []
+                            if admin_checked: new_roles.append("admin")
+                            if data_checked: new_roles.append("data_user")
+                            if chat_checked: new_roles.append("chatbot_user")
+                            
+                            if set_roles(user['id'], new_roles):
+                                st.success("Rollen aktualisiert!")
+                                st.rerun()
+                        
+                        if st.button("📧 Recovery senden", key=f"recovery_{user['id']}"):
+                            if send_recovery(user['email']):
+                                st.rerun()
+                        
+                        # Sicherheitsabfrage für Löschen
+                        delete_confirm = st.checkbox("Bestätigen", key=f"confirm_{user['id']}")
+                        if st.button("🗑️ Löschen", 
+                                   disabled=not delete_confirm, 
+                                   key=f"delete_{user['id']}"):
+                            if delete_user(user['id']):
+                                st.success("Benutzer gelöscht!")
+                                st.rerun()
+                    
+                    st.markdown("---")
+        else:
+            st.info("Keine Benutzer gefunden oder Fehler beim Laden.")
+        
+        # Hinweise
+        st.markdown("#### ℹ️ Hinweise")
+        st.info("""
+        - Nach Rollen-Updates müssen betroffene Benutzer sich neu einloggen
+        - Der Service-Client wird nur serverseitig verwendet 
+        - Alle RLS-Policies bleiben für normale Datenbankabfragen aktiv
+        """)
 
     async def render_delete_preview_ui():
         """Renders the complete document/note preview and delete UI."""
@@ -991,7 +1185,7 @@ async def main():
 
             # Metadaten und Inhalt aus Supabase holen
             try:
-                sb = get_sb_user()
+                sb = get_db_client_for_admin_operations()
                 res = (
                     sb.table("rag_pages")
                     .select("content", "metadata", "chunk_number")
@@ -1208,8 +1402,8 @@ async def main():
                 try:
                     print(f"🗑️ Lösche Datenbankeinträge für: {delete_filename}")
                     
-                    # Use User-Client for RLS compliance - only admins can delete
-                    sb = get_sb_user()
+                    # Use appropriate client (Service for admin, User for others)
+                    sb = get_db_client_for_admin_operations()
                     delete_result = sb.table("rag_pages").delete().eq("url", delete_filename).execute()
                     deleted_count = len(delete_result.data or [])
                     
@@ -1237,8 +1431,8 @@ async def main():
 
                 try:
                     print(f"🗑️ Lösche Storage-Datei: {delete_filename}")
-                    # Use User-Client for RLS compliance - storage policies also apply
-                    sb = get_sb_user()
+                    # Use appropriate client (Service for admin, User for others)
+                    sb = get_db_client_for_admin_operations()
                     sb.storage.from_("privatedocs").remove(
                         [delete_filename]
                     )
@@ -1258,7 +1452,7 @@ async def main():
                     print(
                         f"🔍 Verifikation: Prüfe ob {delete_filename} wirklich gelöscht wurde..."
                     )
-                    sb = get_sb_user()
+                    sb = get_db_client_for_admin_operations()
                     verify_result = (
                         sb.table("rag_pages")
                         .select("id,url")
@@ -1393,6 +1587,8 @@ async def main():
                     full_response = ""
 
                     # Choose between agentic and classic retrieval
+                    rag_agent = None  # Initialize for source processing
+                    
                     if agentic_config is not None:
                         # Use agentic retrieval (silently in background)
                         agentic_result = await run_agentic_retrieval(user_input, agentic_config)
@@ -1401,7 +1597,14 @@ async def main():
                         
                     else:
                         # Use classic streaming retrieval
-                        async for chunk in run_agent_with_streaming(user_input):
+                        rag_agent = get_rag_agent()  # Only needed for classic retrieval
+                        
+                        # Reset akkumulierte Treffer für neue Frage (aber nicht None setzen!)
+                        if hasattr(rag_agent, "last_match"):
+                            rag_agent.last_match = []
+                            print(f"🔄 Reset: Treffer-Akkumulator für neue Frage geleert")
+
+                        async for chunk in run_agent_with_streaming(user_input, rag_agent):
                             full_response += chunk
                             message_placeholder.markdown(full_response + "▌")
 
@@ -1410,7 +1613,17 @@ async def main():
                     txt_sources = defaultdict(set)
                     note_sources = defaultdict(set)
 
+                    # Check for sources from both classic and agentic retrieval
+                    source_chunks = []
+                    
+                    # Classic retrieval sources
                     if hasattr(rag_agent, "last_match") and rag_agent.last_match:
+                        source_chunks = rag_agent.last_match
+                    # Agentic retrieval sources
+                    elif agentic_config is not None and 'last_agentic_matches' in st.session_state:
+                        source_chunks = st.session_state['last_agentic_matches']
+                    
+                    if source_chunks:
                         print("--- Treffer im Retrieval ---")
                         # Score-basierte Filterung für Anzeige - identisch mit Retrieval-Schwelle
                         DISPLAY_MIN_SIM = float(os.getenv("RAG_MIN_SIM", "0.55"))
@@ -1422,7 +1635,7 @@ async def main():
                         all_matches = []
                         best_score = 0
 
-                        for match in rag_agent.last_match:
+                        for match in source_chunks:
                             sim = match.get("similarity", 0)
                             if sim >= DISPLAY_MIN_SIM:
                                 all_matches.append((match, sim))
@@ -1433,7 +1646,7 @@ async def main():
                         unique_sources = set()
                         metadata_matches = 0
                         
-                        for match in rag_agent.last_match:
+                        for match in source_chunks:
                             meta = match.get("metadata", {})
                             source_type = meta.get("source", "")
                             unique_sources.add(source_type)
@@ -1468,7 +1681,8 @@ async def main():
                                 continue
 
                             meta = match.get("metadata", {})
-                            fn = meta.get("original_filename")
+                            # Versuche zuerst original_filename, dann url als Fallback
+                            fn = meta.get("original_filename") or match.get("url", "")
                             pg = meta.get("page", 1)
                             source_type = meta.get("source", "")
 
@@ -1548,9 +1762,11 @@ async def main():
                         )
 
                     # Füge saubere Quellenangaben hinzu
-                    print(f"🔍 Debug: PDF-Quellen gefunden: {dict(pdf_sources)}")
-                    print(f"🔍 Debug: TXT-Quellen gefunden: {dict(txt_sources)}")
-                    print(f"🔍 Debug: Notiz-Quellen gefunden: {dict(note_sources)}")
+                    retrieval_type = "Agentisch" if agentic_config is not None else "Klassisch"
+                    print(f"🔍 Debug ({retrieval_type}): PDF-Quellen gefunden: {dict(pdf_sources)}")
+                    print(f"🔍 Debug ({retrieval_type}): TXT-Quellen gefunden: {dict(txt_sources)}")
+                    print(f"🔍 Debug ({retrieval_type}): Notiz-Quellen gefunden: {dict(note_sources)}")
+                    print(f"🔍 Debug ({retrieval_type}): Source chunks: {len(source_chunks) if source_chunks else 0}")
                     print(
                         f"🔍 Debug: Hat 'keine Informationen' Antwort: {has_no_info_response}"
                     )
@@ -1573,11 +1789,8 @@ async def main():
                                 note_filename = fn  # Fallback für Storage-Link
                                 bucket = "privatedocs"  # Default
 
-                                if (
-                                    hasattr(rag_agent, "last_match")
-                                    and rag_agent.last_match
-                                ):
-                                    for match in rag_agent.last_match:
+                                if source_chunks:
+                                    for match in source_chunks:
                                         meta = match.get("metadata", {})
                                         if meta.get("source") == "manuell" and (
                                             fn in meta.get("original_filename", "")
@@ -1782,15 +1995,28 @@ async def main():
                                     last_msg.parts[i] = TextPart(content=final_response)
                                     break
 
-                                        # 💾 Chat-Historie speichern (RLS via User-Client)
+                                        # 💾 Chat-Historie speichern (Service-Client für Admin, User-Client für andere)
                     try:
-                        sb = get_sb_user()
-                        sb.table("chat_history").insert({
-                            "user_id": st.session_state["user"].id,  # wichtig für Policy
+                        sb = get_db_client_for_admin_operations()
+                        # Versuche zuerst mit user_id, bei Fehler ohne user_id
+                        chat_record = {
                             "user_name": st.session_state["user"].email or "user",
                             "question": user_input,
                             "answer": final_response,
-                        }).execute()
+                        }
+                        
+                        try:
+                            # Versuche mit user_id für neuere Schema-Versionen
+                            chat_record["user_id"] = st.session_state["user"].id
+                            sb.table("chat_history").insert(chat_record).execute()
+                        except Exception as schema_error:
+                            if "user_id" in str(schema_error):
+                                print("⚠️ user_id Spalte nicht verfügbar, verwende Legacy-Schema")
+                                # Entferne user_id und versuche nochmal
+                                chat_record.pop("user_id", None)
+                                sb.table("chat_history").insert(chat_record).execute()
+                            else:
+                                raise schema_error
                     except Exception as e:
                         print(f"⚠️ Fehler beim Speichern der Chat-Historie: {e}")
 
@@ -1877,7 +2103,7 @@ async def main():
                             # Step 1: Initial validation
                             update_note_table("5%", "🔄 Prüfung...")
                             
-                            sb = get_sb_user()
+                            sb = get_db_client_for_admin_operations()
                             existing = (
                                 sb.table("rag_pages")
                                 .select("url")
@@ -1893,8 +2119,8 @@ async def main():
                                 # Step 2: Prepare filename
                                 update_note_table("10%", "🔄 Vorbereitung...")
                                 
-                                # Use User-Client for RLS compliance
-                                sb_user = get_sb_user()
+                                # Use appropriate client (Service for admin, User for others)
+                                sb_user = get_db_client_for_admin_operations()
                                 pipeline = DocumentIngestionPipeline(db_client=sb_user)
                                 tz_berlin = pytz.timezone("Europe/Berlin")
                                 now_berlin = datetime.now(tz_berlin)
@@ -2215,7 +2441,7 @@ async def main():
                             file_hash = compute_file_hash(file_bytes)
 
                             # 🔍 Duplikatprüfung anhand Hash
-                            sb = get_sb_user()
+                            sb = get_db_client_for_admin_operations()
                             existing_hash = (
                                 sb.table("rag_pages")
                                 .select("id")
@@ -2232,7 +2458,7 @@ async def main():
                                 continue
 
                             # ✅ Duplikatprüfung vor Upload
-                            sb = get_sb_user()
+                            sb = get_db_client_for_admin_operations()
                             existing = (
                                 sb.table("rag_pages")
                                 .select("id")
@@ -2519,6 +2745,16 @@ async def main():
                 unsafe_allow_html=True,
             )
 
+
+    # Benutzerverwaltungs-Tab (vorletzter Tab - nur für admin)
+    if has_role("admin"):
+        # Berechne Index: letzter Tab wenn nur admin, vorletzter wenn auch delete-Tab da ist
+        if has_role("data_user", "admin"):
+            tab_index = len(tabs) - 2  # Vorletzter Tab (vor delete)
+        else:
+            tab_index = len(tabs) - 1  # Letzter Tab
+        with tabs[tab_index]:
+            render_user_management()
 
     # Del-Tab (letzter Tab wenn verfügbar) 
     if has_role("data_user", "admin"):

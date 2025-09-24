@@ -139,10 +139,53 @@ class KnowledgeBaseSearch:
                 filter_metadata=filter_metadata,
             )
         else:
-            # Use direct client - fallback to basic search
-            # Note: This is a simplified implementation for RLS compatibility
-            vector_results = []
-            keyword_results = []
+            # Use direct client for search operations
+            # Implement the same logic as SupabaseClient methods
+            
+            # Vector search using match_rag_pages RPC function
+            try:
+                match_threshold = float(os.getenv("RAG_MIN_SIM", "0.55"))
+                
+                rpc_params = {
+                    "query_embedding": query_embedding,
+                    "match_threshold": match_threshold,
+                    "match_count": candidate_count,
+                }
+
+                if filter_metadata:
+                    rpc_params["filter"] = filter_metadata
+
+                result = self.db_client.rpc("match_rag_pages", rpc_params).execute()
+                
+                if result.data:
+                    # Zusätzliche lokale Filterung nach Similarity
+                    vector_results = [r for r in result.data if r.get("similarity", 0) >= match_threshold]
+                    print(f"\n🔍 Top {len(vector_results)} RAG-Matches (von {len(result.data)} gefiltert):")
+                    for r in vector_results:
+                        score = r.get("similarity", 0.0)
+                        preview = r["content"][:120].replace("\n", " ")
+                        print(f"  • Score: {score:.3f} → {preview}...")
+                else:
+                    print("⚠️ Keine Dokument-Treffer für die Anfrage gefunden.")
+                    vector_results = []
+            except Exception as e:
+                print("❌ Fehler bei Supabase-RPC:", str(e))
+                vector_results = []
+
+            # Keyword search
+            try:
+                qb = self.db_client.table("rag_pages").select(
+                    "id,url,chunk_number,content,metadata"
+                )
+                if filter_metadata:
+                    for key, value in filter_metadata.items():
+                        qb = qb.contains("metadata", {key: value})
+                qb = qb.ilike("content", f"%{params.query}%").limit(candidate_count)
+                result = qb.execute()
+                keyword_results = result.data or []
+            except Exception as e:
+                print("❌ Fehler bei Keyword-Suche:", e)
+                keyword_results = []
         # Kombiniere Ergebnisse mit verbesserter Filterung
         # Keyword-Suche nur als Fallback, wenn Vector-Suche leer ist
         if vector_results:
@@ -313,6 +356,27 @@ class KnowledgeBaseSearch:
                 
                 # Fetch actual content chunks from this document
                 content_response = self.db_client.table("rag_pages").select("*").eq("url", source_url).limit(5).execute()
+                
+                # Fallback: If no chunks found with source_url, try matching by title
+                if not content_response.data and doc_title:
+                    print(f"   🔄 No chunks found for {source_url}, trying title-based match...")
+                    # Try various title formats
+                    title_variants = [
+                        doc_title,  # Original title
+                        doc_title.replace('"', ''),  # Remove quotes
+                        doc_title.replace('"', '"').replace('"', '"'),  # Smart quotes
+                        f'Info zu Öl "{doc_title.split('"')[1]}"' if '"' in doc_title else doc_title,  # Format variants
+                    ]
+                    
+                    for variant in title_variants:
+                        if variant != source_url:  # Don't retry the already failed source_url
+                            print(f"   🔄 Trying title variant: '{variant}'")
+                            fallback_response = self.db_client.table("rag_pages").select("*").eq("url", variant).limit(5).execute()
+                            if fallback_response.data:
+                                content_response = fallback_response
+                                print(f"   ✅ Found chunks using title variant: '{variant}'")
+                                source_url = variant  # Update source_url for consistent metadata
+                                break
                 
                 if content_response.data:
                     for chunk_data in content_response.data:
