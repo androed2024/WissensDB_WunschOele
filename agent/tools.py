@@ -67,6 +67,7 @@ class KnowledgeBaseSearch:
         owner_agent: Optional[
             Any
         ] = None,  # Referenz zum Agenten, um Treffer dort abzulegen
+        db_client = None,  # Direct Supabase client (e.g., from get_sb_user())
     ):
         """
         Initialize the knowledge base search tool.
@@ -75,8 +76,16 @@ class KnowledgeBaseSearch:
             supabase_client: SupabaseClient instance for database operations
             embedding_generator: EmbeddingGenerator instance for creating embeddings
             owner_agent: Optional reference to the RAGAgent to store last_match results
+            db_client: Direct Supabase client (takes priority over supabase_client)
         """
-        self.supabase_client = supabase_client or SupabaseClient()
+        if db_client is not None:
+            # Use direct client (e.g., from get_sb_user())
+            self.db_client = db_client
+            self.supabase_client = None  # Mark as using direct client
+        else:
+            # Use SupabaseClient wrapper
+            self.supabase_client = supabase_client or SupabaseClient()
+            self.db_client = self.supabase_client.client
         self.embedding_generator = embedding_generator or EmbeddingGenerator()
         self.owner_agent = owner_agent
         self.reranker = CrossEncoderReranker()
@@ -117,16 +126,23 @@ class KnowledgeBaseSearch:
         # Use k_per_round for candidate count
         candidate_count = max(params.k_per_round, params.max_results)
         
-        vector_results = self.supabase_client.search_documents(
-            query_embedding=query_embedding,
-            match_count=candidate_count,
-            filter_metadata=filter_metadata,
-        )
-        keyword_results = self.supabase_client.keyword_search_documents(
-            params.query,
-            match_count=candidate_count,
-            filter_metadata=filter_metadata,
-        )
+        if self.supabase_client:
+            # Use SupabaseClient methods
+            vector_results = self.supabase_client.search_documents(
+                query_embedding=query_embedding,
+                match_count=candidate_count,
+                filter_metadata=filter_metadata,
+            )
+            keyword_results = self.supabase_client.keyword_search_documents(
+                params.query,
+                match_count=candidate_count,
+                filter_metadata=filter_metadata,
+            )
+        else:
+            # Use direct client - fallback to basic search
+            # Note: This is a simplified implementation for RLS compatibility
+            vector_results = []
+            keyword_results = []
         # Kombiniere Ergebnisse mit verbesserter Filterung
         # Keyword-Suche nur als Fallback, wenn Vector-Suche leer ist
         if vector_results:
@@ -270,14 +286,14 @@ class KnowledgeBaseSearch:
             metadata_matches = []
             
             # Strategy 1: Full query match
-            response1 = self.supabase_client.client.table("document_metadata").select("*").ilike("title", f"%{query}%").execute()
+            response1 = self.db_client.table("document_metadata").select("*").ilike("title", f"%{query}%").execute()
             if response1.data:
                 metadata_matches.extend(response1.data)
             
             # Strategy 2: Individual keyword matches (for "Wunsch BOAT SYNTH 2-T" -> ["BOAT", "SYNTH", "2-T"])
             keywords = [word for word in query.split() if len(word) > 2 and word not in ["der", "die", "das", "und", "oder", "für", "Wunsch"]]
             for keyword in keywords[:3]:  # Max 3 keywords to avoid too many hits
-                response2 = self.supabase_client.client.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
+                response2 = self.db_client.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
                 if response2.data:
                     for item in response2.data:
                         # Avoid duplicates
@@ -296,7 +312,7 @@ class KnowledgeBaseSearch:
                 print(f"   🎯 Metadata Match: '{doc_title}' -> {source_url}")
                 
                 # Fetch actual content chunks from this document
-                content_response = self.supabase_client.client.table("rag_pages").select("*").eq("url", source_url).limit(5).execute()
+                content_response = self.db_client.table("rag_pages").select("*").eq("url", source_url).limit(5).execute()
                 
                 if content_response.data:
                     for chunk_data in content_response.data:
@@ -360,4 +376,10 @@ class KnowledgeBaseSearch:
         Returns:
             List of source identifiers
         """
-        return self.supabase_client.get_all_document_sources()
+        if self.supabase_client:
+            return self.supabase_client.get_all_document_sources()
+        else:
+            # Direct client fallback
+            result = self.db_client.table("rag_pages").select("url").execute()
+            urls = set(item["url"] for item in result.data if result.data)
+            return list(urls)

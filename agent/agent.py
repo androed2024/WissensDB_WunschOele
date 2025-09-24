@@ -43,7 +43,7 @@ load_dotenv(dotenv_path, override=True)
 
 # Supabase-Konfiguration (Service-Role-Key!)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANNON_KEY")
 
 # Lazy-init placeholder
 global_supabase = None
@@ -99,11 +99,18 @@ class AgenticRetrievalOrchestrator:
     def __init__(
         self, 
         kb_search: Optional[KnowledgeBaseSearch] = None,
-        openai_client: Optional[OpenAI] = None
+        openai_client: Optional[OpenAI] = None,
+        db_client = None  # Direct Supabase client (e.g., from get_sb_user())
     ):
-        self.kb_search = kb_search or KnowledgeBaseSearch()
+        if db_client is not None:
+            # Use the provided db_client for KnowledgeBaseSearch
+            self.kb_search = kb_search or KnowledgeBaseSearch(db_client=db_client)
+        else:
+            self.kb_search = kb_search or KnowledgeBaseSearch()
+        
         self.openai_client = openai_client or OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.db_client = db_client
         
     async def run(self, question: str, config: Optional[AgenticRetrievalConfig] = None) -> Dict[str, Any]:
         """
@@ -309,7 +316,13 @@ class AgenticRetrievalOrchestrator:
         from database.setup import SupabaseClient
         
         try:
-            supabase_client = SupabaseClient()
+            if self.db_client:
+                # Use provided User client (RLS-enabled)
+                db = self.db_client
+            else:
+                # Fallback to Service client
+                supabase_client = SupabaseClient()
+                db = supabase_client.client
             
             print(f"   🔍 Metadata-Suche: '{sub_query}'")
             
@@ -317,14 +330,14 @@ class AgenticRetrievalOrchestrator:
             metadata_matches = []
             
             # Strategy 1: Full query match
-            response1 = supabase_client.client.table("document_metadata").select("*").ilike("title", f"%{sub_query}%").execute()
+            response1 = db.table("document_metadata").select("*").ilike("title", f"%{sub_query}%").execute()
             if response1.data:
                 metadata_matches.extend(response1.data)
             
             # Strategy 2: Individual keyword matches (for "Wunsch BOAT SYNTH 2-T" -> ["BOAT", "SYNTH", "2-T"])
             keywords = [word for word in sub_query.split() if len(word) > 2 and word not in ["der", "die", "das", "und", "oder", "für"]]
             for keyword in keywords[:3]:  # Max 3 keywords to avoid too many hits
-                response2 = supabase_client.client.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
+                response2 = db.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
                 if response2.data:
                     for item in response2.data:
                         # Avoid duplicates
@@ -343,7 +356,7 @@ class AgenticRetrievalOrchestrator:
                 print(f"   🎯 Metadata Match: '{doc_title}' -> {source_url}")
                 
                 # Robust URL matching: Try exact match first, then title-based fallback
-                content_response = supabase_client.client.table("rag_pages").select("*").eq("url", source_url).limit(5).execute()
+                content_response = db.table("rag_pages").select("*").eq("url", source_url).limit(5).execute()
                 
                 # Fallback: If no chunks found with source_url, try matching by title
                 if not content_response.data and doc_title:
@@ -359,7 +372,7 @@ class AgenticRetrievalOrchestrator:
                     for variant in title_variants:
                         if variant != source_url:  # Don't retry the already failed source_url
                             print(f"   🔄 Trying title variant: '{variant}'")
-                            fallback_response = supabase_client.client.table("rag_pages").select("*").eq("url", variant).limit(5).execute()
+                            fallback_response = db.table("rag_pages").select("*").eq("url", variant).limit(5).execute()
                             if fallback_response.data:
                                 content_response = fallback_response
                                 print(f"   ✅ Found chunks using title variant: '{variant}'")
@@ -582,6 +595,7 @@ class RAGAgent:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         kb_search: Optional[KnowledgeBaseSearch] = None,
+        db_client = None,  # Direct Supabase client (e.g., from get_sb_user())
     ):
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -591,7 +605,10 @@ class RAGAgent:
                 "OpenAI API key must be provided either as an argument or environment variable."
             )
 
-        self.kb_search = kb_search or KnowledgeBaseSearch(owner_agent=self)
+        if db_client is not None:
+            self.kb_search = kb_search or KnowledgeBaseSearch(owner_agent=self, db_client=db_client)
+        else:
+            self.kb_search = kb_search or KnowledgeBaseSearch(owner_agent=self)
         self.search_tool = Tool(self.kb_search.search)
 
         self.agent = Agent(

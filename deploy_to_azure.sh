@@ -46,7 +46,7 @@ az webapp config appsettings set -g $RG -n $APP_NAME --settings \
   STREAMLIT_SERVER_PORT=8501 \
   OPENAI_API_KEY=sk-... \
   SUPABASE_URL=https://... \
-  SUPABASE_KEY=...
+  SUPABASE_ANNON_KEY=...
 
 echo "🌍 URL:"
 az webapp show -g $RG -n $APP_NAME --query defaultHostName -o tsv

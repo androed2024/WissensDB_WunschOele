@@ -61,7 +61,7 @@ Create a `.env.example` file with the following variables:
 - `OPENAI_API_KEY`: For embeddings and LLM
 - `OPENAI_MODEL`: e.g., "gpt-4.1-mini" or other models
 - `SUPABASE_URL`: URL for Supabase instance
-- `SUPABASE_KEY`: API key for Supabase
+- `SUPABASE_ANNON_KEY`: API key for Supabase
 
 This file will serve as a template for users to create their own `.env` file.
 

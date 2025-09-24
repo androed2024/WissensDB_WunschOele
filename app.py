@@ -20,6 +20,9 @@ import pytz
 
 from base64 import b64encode
 
+from supabase import create_client
+
+
 # Reduce verbosity by logging only informational messages and above
 logging.basicConfig(level=logging.INFO)
 
@@ -92,6 +95,10 @@ DB_BATCH_SIZE = int(os.getenv("DB_BATCH_SIZE", "100"))
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+
+# Auth-Client (für Login/Passwort ändern)
+sb_auth = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 
 app_version = os.getenv("APP_VERSION", "0.0")
@@ -180,29 +187,40 @@ def render_header():
     doc_count = st.session_state.get("document_count", 0)
     note_count = st.session_state.get("knowledge_count", 0)
 
+
     st.markdown(
         f"""
-    <div style="height:4px;"></div>  <!-- ≈ 1mm Abstand -->
+    <div style="height:4px;"></div>
     <div class="header-flex" style="display:flex;justify-content:space-between;align-items:center;margin:0;padding:0;">
         <div class="header-title-wrap" style="display:flex;align-items:center;">
             <img src="data:image/png;base64,{encoded}" alt="Logo" style="height:32px;margin-right:8px;">
             <span style="font-size:18px;font-weight:600;">Wunsch-Öle Wissens Agent</span>
             <span style="color:#007BFF;font-size:12px;margin-left:8px;">🔧 Version: {app_version}</span>
         </div>
-        <div style="font-size:12px;">
-            📄 Dokumente: {doc_count} &nbsp;&nbsp;&nbsp; 🧠 Notizen: {note_count}
+        <div style="display:flex; gap:16px; align-items:center; font-size:12px;">
+            <span>📄 Dokumente: {doc_count} &nbsp;&nbsp; 🧠 Notizen: {note_count}</span>
         </div>
     </div>
     <hr style="margin:2px 0 6px 0;border-top-width:1px;">
     """,
         unsafe_allow_html=True,
     )
+    # ➜ direkt nach dem Markdown das Popover rendern:
+    user_menu()
 
 
 supabase_client = SupabaseClient()
 
-# Initialize Agentic Retrieval Orchestrator
-agentic_orchestrator = AgenticRetrievalOrchestrator()
+# Agent instances will be created with User-Client when needed
+def get_agentic_orchestrator():
+    """Get AgenticRetrievalOrchestrator with User-Client."""
+    sb = get_sb_user()
+    return AgenticRetrievalOrchestrator(db_client=sb)
+
+def get_rag_agent():
+    """Get RAGAgent with User-Client."""
+    sb = get_sb_user()
+    return RAGAgent(db_client=sb)
 
 async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig) -> Dict[str, Any]:
     """
@@ -218,13 +236,11 @@ async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig)
     print(f"\n🔵 [USER INPUT] Original-Frage (Agentisch): {user_input}")
     
     try:
-        result = await agentic_orchestrator.run(user_input, config)
+        orchestrator = get_agentic_orchestrator()
+        result = await orchestrator.run(user_input, config)
         
-        # Set last_match for UI compatibility  
-        if hasattr(rag_agent, 'last_match'):
-            rag_agent.last_match = result.get('source_chunks', [])
-        else:
-            rag_agent.last_match = result.get('source_chunks', [])
+        # Set last_match for UI compatibility (store in session_state for persistence)
+        st.session_state['last_agentic_matches'] = result.get('source_chunks', [])
             
         return result
         
@@ -237,6 +253,85 @@ async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig)
             "source_chunks": [],
             "error": str(e)
         }
+
+def _build_user_client(access_token: str):
+    """Erzeuge einen Supabase-Client, der mit dem User-JWT gegen PostgREST authentifiziert ist (RLS greift)."""
+    sb = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    sb.postgrest.auth(access_token)
+    return sb
+
+def ensure_login():
+    if "user" in st.session_state and "sb_user" in st.session_state:
+        return
+
+    st.subheader("Anmelden")
+
+    # Atomare Form: vermeidet Rerun-Rennen & Autofill-Probleme
+    with st.form("login_form", clear_on_submit=False):
+        st.text_input("E-Mail", key="login_email", value=st.session_state.get("login_email",""))
+        st.text_input("Passwort", type="password", key="login_pw")
+        submit = st.form_submit_button("Anmelden", use_container_width=True)
+
+    if not submit:
+        st.stop()
+
+    # Werte NACH Submit aus session_state ziehen (stabil bei Autofill)
+    email = (st.session_state.get("login_email") or "").strip()
+    pw    = st.session_state.get("login_pw") or ""
+
+    if not email or not pw:
+        st.error("Bitte E-Mail und Passwort eingeben.")
+        st.stop()
+
+    try:
+        # SDK-Kompatibilität (dict vs. named args)
+        try:
+            res = sb_auth.auth.sign_in_with_password({"email": email, "password": pw})
+        except TypeError:
+            res = sb_auth.auth.sign_in_with_password(email=email, password=pw)
+
+        st.session_state["session"] = res.session
+        st.session_state["user"]    = res.user
+        st.session_state["roles"]   = (res.user.app_metadata or {}).get("roles", [])
+        st.session_state["sb_user"] = _build_user_client(res.session.access_token)
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"Login fehlgeschlagen: {e}")
+        st.stop()
+
+
+def get_sb_user():
+    """Hole den User-Client (mit JWT)."""
+    return st.session_state.get("sb_user")
+
+def has_role(*wanted):
+    roles = st.session_state.get("roles", []) or []
+    return ("admin" in roles) or any(r in roles for r in wanted)
+
+def user_menu():
+    """Popover rechts oben: Rollen anzeigen, Passwort ändern, Logout."""
+    u = st.session_state.get("user")
+    if not u: return
+    roles = ", ".join(st.session_state.get("roles", [])) or "keine Rollen"
+
+    with st.popover(f"User: {u.email}"):
+        st.caption(f"Rollen: {roles}")
+        old = st.text_input("Altes Passwort", type="password", key="pw_old")
+        new = st.text_input("Neues Passwort", type="password", key="pw_new")
+        if st.button("Passwort ändern"):
+            try:
+                # Re-Auth (falls nötig) & Passwort setzen
+                sb_auth.auth.sign_in_with_password({"email": u.email, "password": old})
+                sb_auth.auth.update_user({"password": new})
+                st.success("Passwort geändert.")
+            except Exception as e:
+                st.error(f"Änderung fehlgeschlagen: {e}")
+        if st.button("Logout"):
+            sb_auth.auth.sign_out()
+            for k in ("session","user","roles","sb_user"):
+                st.session_state.pop(k, None)
+            st.rerun()
 
 
 def render_agentic_config_sidebar():
@@ -405,7 +500,9 @@ async def process_document(
     Returns:
         Dict mit success, chunk_count und ggf. error
     """
-    pipeline = DocumentIngestionPipeline()
+    # Use User-Client for RLS compliance
+    sb = get_sb_user()
+    pipeline = DocumentIngestionPipeline(db_client=sb)
     loop = asyncio.get_event_loop()
 
     try:
@@ -477,14 +574,17 @@ async def run_agent_with_streaming(user_input: str):
     # Log der Original-Frage vom User
     print(f"\n🔵 [USER INPUT] Original-Frage: {user_input}")
 
+    # Get User-Client RAG agent
+    user_rag_agent = get_rag_agent()
+    
     # Reset akkumulierte Treffer für neue Frage (aber nicht None setzen!)
-    if hasattr(rag_agent, "last_match"):
-        rag_agent.last_match = []
+    if hasattr(user_rag_agent, "last_match"):
+        user_rag_agent.last_match = []
         print(f"🔄 Reset: Treffer-Akkumulator für neue Frage geleert")
 
-    async with rag_agent.agent.iter(
+    async with user_rag_agent.agent.iter(
         user_input,
-        deps={"kb_search": rag_agent.kb_search},
+        deps={"kb_search": user_rag_agent.kb_search},
         message_history=st.session_state.messages,
     ) as run:
         async for node in run:
@@ -507,7 +607,8 @@ async def run_agent_with_streaming(user_input: str):
 def get_chat_history(search_term: str = "") -> List[Dict]:
     """Holt Chat-Historie aus Supabase mit optionaler Wildcard-Suche"""
     try:
-        query = supabase_client.client.table("chat_history").select("*")
+        sb = get_sb_user()
+        query = sb.table("chat_history").select("*")
 
         if search_term.strip():
             # Wildcard-Suche auf Frage-Feld
@@ -741,9 +842,12 @@ def render_chat_history():
 
 async def update_available_sources():
     try:
-        response = (
-            supabase_client.client.table("rag_pages").select("url, metadata").execute()
-        )
+        # response = (supabase_client.client.table("rag_pages").select("url, metadata").execute()
+
+        # neu (RLS greift):
+        sb = get_sb_user()
+        response = sb.table("rag_pages").select("url, metadata").execute()
+
 
         file_set = set()
         knowledge_set = set()
@@ -778,8 +882,10 @@ async def update_available_sources():
             if key in st.session_state:
                 del st.session_state[key]
 
-
 async def main():
+    # 0) Login erzwingen
+    ensure_login()
+
     # Erst Daten laden, dann Header rendern
     await update_available_sources()
     render_header()
@@ -1266,16 +1372,18 @@ async def main():
                                     last_msg.parts[i] = TextPart(content=final_response)
                                     break
 
-                    # 💾 Chat-Historie speichern
+                                        # 💾 Chat-Historie speichern (RLS via User-Client)
                     try:
-                        supabase_client.save_chat_history(
-                            user_name="admin",
-                            question=user_input,
-                            answer=final_response,
-                        )
+                        sb = get_sb_user()
+                        sb.table("chat_history").insert({
+                            "user_id": st.session_state["user"].id,  # wichtig für Policy
+                            "user_name": st.session_state["user"].email or "user",
+                            "question": user_input,
+                            "answer": final_response,
+                        }).execute()
                     except Exception as e:
                         print(f"⚠️ Fehler beim Speichern der Chat-Historie: {e}")
-                        # Fehler beim Speichern der Historie soll die App nicht zum Absturz bringen
+
 
                 st.markdown("</div>", unsafe_allow_html=True)
             # Kein else-Block nötig - ohne Input wird einfach nichts angezeigt
@@ -1354,8 +1462,9 @@ async def main():
                             # Step 1: Initial validation
                             update_note_table("5%", "🔄 Prüfung...")
                             
+                            sb = get_sb_user()
                             existing = (
-                                supabase_client.client.table("rag_pages")
+                                sb.table("rag_pages")
                                 .select("url")
                                 .ilike("url", f"{manual_title.strip()}%")
                                 .execute()
@@ -1369,7 +1478,9 @@ async def main():
                                 # Step 2: Prepare filename
                                 update_note_table("10%", "🔄 Vorbereitung...")
                                 
-                                pipeline = DocumentIngestionPipeline()
+                                # Use User-Client for RLS compliance
+                                sb_user = get_sb_user()
+                                pipeline = DocumentIngestionPipeline(db_client=sb_user)
                                 tz_berlin = pytz.timezone("Europe/Berlin")
                                 now_berlin = datetime.now(tz_berlin)
                                 timestamp = now_berlin.strftime("%Y-%m-%d %H:%M")
@@ -1689,8 +1800,9 @@ async def main():
                             file_hash = compute_file_hash(file_bytes)
 
                             # 🔍 Duplikatprüfung anhand Hash
+                            sb = get_sb_user()
                             existing_hash = (
-                                supabase_client.client.table("rag_pages")
+                                sb.table("rag_pages")
                                 .select("id")
                                 .eq("metadata->>file_hash", file_hash)
                                 .execute()
@@ -1705,8 +1817,9 @@ async def main():
                                 continue
 
                             # ✅ Duplikatprüfung vor Upload
+                            sb = get_sb_user()
                             existing = (
-                                supabase_client.client.table("rag_pages")
+                                sb.table("rag_pages")
                                 .select("id")
                                 .eq("url", safe_filename)
                                 .execute()
@@ -2042,8 +2155,9 @@ async def main():
 
             # Metadaten und Inhalt aus Supabase holen
             try:
+                sb = get_sb_user()
                 res = (
-                    supabase_client.client.table("rag_pages")
+                    sb.table("rag_pages")
                     .select("content", "metadata", "chunk_number")
                     .eq("url", delete_filename)
                     .order("chunk_number")  # Chunks in richtiger Reihenfolge
@@ -2257,9 +2371,12 @@ async def main():
                 # Erst Datenbank, dann Storage löschen (umgekehrte Reihenfolge)
                 try:
                     print(f"🗑️ Lösche Datenbankeinträge für: {delete_filename}")
-                    deleted_count = supabase_client.delete_documents_by_filename(
-                        delete_filename
-                    )
+                    
+                    # Use User-Client for RLS compliance - only admins can delete
+                    sb = get_sb_user()
+                    delete_result = sb.table("rag_pages").delete().eq("url", delete_filename).execute()
+                    deleted_count = len(delete_result.data or [])
+                    
                     st.code(
                         f"🩨 SQL-Delete für '{delete_filename}' – {deleted_count} Einträge entfernt."
                     )
@@ -2273,28 +2390,41 @@ async def main():
                             f"⚠️ Keine Datenbankeinträge für {delete_filename} gefunden"
                         )
                 except Exception as e:
-                    st.error(f"Datenbank-Löschung fehlgeschlagen: {e}")
-                    print(f"❌ Datenbank-Löschung fehlgeschlagen: {e}")
+                    error_msg = str(e).lower()
+                    if "403" in error_msg or "forbidden" in error_msg or "not allowed" in error_msg:
+                        st.error("❌ Löschung nicht erlaubt. Nur Administratoren können Dokumente löschen.")
+                        print(f"🚫 RLS-Blockierung: Benutzer hat keine Löschberechtigung für {delete_filename}")
+                    else:
+                        st.error(f"Datenbank-Löschung fehlgeschlagen: {e}")
+                        print(f"❌ Datenbank-Löschung fehlgeschlagen: {e}")
                     db_deleted = False
 
                 try:
                     print(f"🗑️ Lösche Storage-Datei: {delete_filename}")
-                    supabase_client.client.storage.from_("privatedocs").remove(
+                    # Use User-Client for RLS compliance - storage policies also apply
+                    sb = get_sb_user()
+                    sb.storage.from_("privatedocs").remove(
                         [delete_filename]
                     )
                     storage_deleted = True
                     print(f"✅ Storage-Datei erfolgreich gelöscht")
                 except Exception as e:
-                    st.error(f"Löschen aus dem Speicher fehlgeschlagen: {e}")
-                    print(f"❌ Storage-Löschung fehlgeschlagen: {e}")
+                    error_msg = str(e).lower()
+                    if "403" in error_msg or "forbidden" in error_msg or "not allowed" in error_msg:
+                        st.error("❌ Storage-Löschung nicht erlaubt. Nur Administratoren können Dateien aus dem Speicher löschen.")
+                        print(f"🚫 RLS-Blockierung: Benutzer hat keine Storage-Löschberechtigung für {delete_filename}")
+                    else:
+                        st.error(f"Löschen aus dem Speicher fehlgeschlagen: {e}")
+                        print(f"❌ Storage-Löschung fehlgeschlagen: {e}")
 
                 # Zusätzliche Verifikation: Prüfe ob wirklich gelöscht
                 try:
                     print(
                         f"🔍 Verifikation: Prüfe ob {delete_filename} wirklich gelöscht wurde..."
                     )
+                    sb = get_sb_user()
                     verify_result = (
-                        supabase_client.client.table("rag_pages")
+                        sb.table("rag_pages")
                         .select("id,url")
                         .eq("url", delete_filename)
                         .execute()

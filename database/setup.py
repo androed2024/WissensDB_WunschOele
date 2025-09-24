@@ -30,7 +30,7 @@ class SupabaseClient:
         self, supabase_url: Optional[str] = None, supabase_key: Optional[str] = None
     ):
         self.supabase_url = supabase_url or os.getenv("SUPABASE_URL")
-        self.supabase_key = supabase_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+        self.supabase_key = supabase_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANNON_KEY")
 
         if not self.supabase_url or not self.supabase_key:
             raise ValueError(
@@ -187,21 +187,36 @@ class SupabaseClient:
             print(f"❌ Fehler beim Löschen von {filename} in rag_pages: {e}")
             return 0
 
-    def save_chat_history(self, user_name: str, question: str, answer: str) -> Dict[str, Any]:
+    def save_chat_history(self, user_name: str, question: str, answer: str, user_id: str = None) -> Dict[str, Any]:
         """
-        Speichert eine Frage-Antwort-Interaktion in der chat_history Tabelle.
+        DEPRECATED: Speichert eine Frage-Antwort-Interaktion in der chat_history Tabelle.
+        
+        WARNING: Diese Methode ist deprecated. Verwende stattdessen get_sb_user().table("chat_history").insert(...)
+        mit expliziter user_id für RLS-Compliance.
         
         Args:
-            user_name: Name des Benutzers (aktuell "admin")
+            user_name: Name des Benutzers
             question: Die Frage des Benutzers
             answer: Die Antwort des KI Chatbots
+            user_id: UUID des Benutzers (erforderlich für RLS)
             
         Returns:
             Dict mit den gespeicherten Daten oder leer bei Fehler
         """
+        import warnings
+        warnings.warn(
+            "save_chat_history ist deprecated. Verwende get_sb_user().table('chat_history').insert(...) mit user_id.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        
         try:
+            if not user_id:
+                raise ValueError("user_id ist erforderlich für RLS Policy Compliance")
+            
             # MEZ Zeitzone für created_at wird automatisch von Supabase gesetzt
             data = {
+                "user_id": user_id,
                 "user_name": user_name,
                 "question": question,
                 "answer": answer

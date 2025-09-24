@@ -42,7 +42,7 @@ def _clamp01(value: float) -> float:
 
 
 class DocumentIngestionPipeline:
-    def __init__(self, supabase_client: Optional[SupabaseClient] = None):
+    def __init__(self, supabase_client: Optional[SupabaseClient] = None, db_client=None):
         # Load chunk parameters from environment variables
         chunk_size = int(os.getenv('CHUNK_SIZE', 1000))
         chunk_overlap = int(os.getenv('CHUNK_OVERLAP', 200))
@@ -52,6 +52,11 @@ class DocumentIngestionPipeline:
         self.embedding_generator = EmbeddingGenerator()
         self.max_file_size_mb = 10
         self.supabase_client = supabase_client or SupabaseClient()
+        self.db_client = db_client  # Direct Supabase client (e.g., from get_sb_user())
+        
+    def _get_db_client(self):
+        """Get DB client - User-Client takes priority over Service-Client."""
+        return self.db_client or self.supabase_client.client
         logger.info(f"Initialized DocumentIngestionPipeline with chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
         logger.info(f"AgenticSegmenter configured with max_tokens={self.segmenter.max_tokens}, "
                    f"soft_max={self.segmenter.soft_max_tokens}, min_tokens={self.segmenter.min_tokens}")
@@ -121,7 +126,8 @@ class DocumentIngestionPipeline:
                 # Versuche Upsert mit neuen Spalten - first try without on_conflict
                 try:
                     # Try simple insert first
-                    doc_resp = self.supabase_client.client.table("document_metadata").insert(doc_row).execute()
+                    db = self._get_db_client()
+                    doc_resp = db.table("document_metadata").insert(doc_row).execute()
                     doc_id = doc_resp.data[0]["doc_id"]
                     logger.info("Doc row (insert) → title=%s | created(file)=%s | modified(file)=%s",
                                doc_row["title"], doc_row.get("file_created_at"), doc_row.get("file_modified_at"))
@@ -129,7 +135,8 @@ class DocumentIngestionPipeline:
                     # If insert fails, try upsert with appropriate on_conflict
                     try:
                         on_conflict_cols = "file_hash" if doc_row.get("file_hash") else "source_url"
-                        doc_resp = self.supabase_client.client.table("document_metadata").upsert(doc_row, on_conflict=on_conflict_cols).execute()
+                        db = self._get_db_client()
+                        doc_resp = db.table("document_metadata").upsert(doc_row, on_conflict=on_conflict_cols).execute()
                         doc_id = doc_resp.data[0]["doc_id"]
                         logger.info("Doc row (upsert) → title=%s | created(file)=%s | modified(file)=%s | on_conflict=%s",
                                    doc_row["title"], doc_row.get("file_created_at"), doc_row.get("file_modified_at"), on_conflict_cols)
@@ -139,7 +146,8 @@ class DocumentIngestionPipeline:
                         # Remove conflicting unique fields but keep all other metadata
                         fallback_row = doc_row.copy()
                         fallback_row.pop("file_hash", None)  # Remove file_hash to avoid conflicts
-                        doc_resp = self.supabase_client.client.table("document_metadata").insert(fallback_row).execute()
+                        db = self._get_db_client()
+                        doc_resp = db.table("document_metadata").insert(fallback_row).execute()
                         doc_id = doc_resp.data[0]["doc_id"]
                         logger.info("Doc row (fallback insert) → title=%s | created(file)=%s | modified(file)=%s", 
                                    fallback_row["title"], fallback_row.get("file_created_at"), fallback_row.get("file_modified_at"))
@@ -151,7 +159,8 @@ class DocumentIngestionPipeline:
                     "source_url": base_meta.get("source_url") or base_meta.get("original_filename") or os.path.basename(file_path),
                     "doc_type": base_meta.get("doc_type") or processor_metadata.get("content_type") or "application/octet-stream",
                 }
-                doc_insert = self.supabase_client.client.table("document_metadata").insert(doc_row_basic).execute()
+                db = self._get_db_client()
+                doc_insert = db.table("document_metadata").insert(doc_row_basic).execute()
                 doc_id = doc_insert.data[0]["doc_id"]
                 logger.info("Doc row (insert fallback) → title=%s | NOTE: file_created_at/file_modified_at not saved due to old schema", doc_row_basic["title"])
                 logger.info("Missing metadata would be: created(file)=%s | modified(file)=%s", pdf_created or fs_ctime, pdf_modified or fs_mtime)
@@ -390,7 +399,8 @@ class DocumentIngestionPipeline:
         chunk_overlap = int(os.getenv('CHUNK_OVERLAP', 200))
         chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         embedding_generator = EmbeddingGenerator()
-        supabase = SupabaseClient()
+        # Use class DB client logic instead of creating new instance
+        db = self._get_db_client()
 
         # Duplikatsprüfung und document_metadata Insert nur für manuelle Notizen
         doc_id = None
@@ -409,7 +419,7 @@ class DocumentIngestionPipeline:
             # Prüfe zuerst ob die neue Schema-Unterstützung vorhanden ist
             try:
                 # Test-Query um zu prüfen ob file_hash Spalte existiert
-                test_result = supabase.client.table("document_metadata").select("file_hash").limit(1).execute()
+                test_result = db.table("document_metadata").select("file_hash").limit(1).execute()
                 has_schema_support = True
                 logger.info("Schema supports file_hash - deduplication enabled")
             except Exception as e:
@@ -419,7 +429,7 @@ class DocumentIngestionPipeline:
             # Duplikatsuche nur wenn Schema-Unterstützung vorhanden
             if has_schema_support:
                 try:
-                    existing = supabase.client.table("document_metadata").select("doc_id").eq(
+                    existing = db.table("document_metadata").select("doc_id").eq(
                         "file_hash", note_hash
                     ).eq("title", manual_title).eq("doc_type", metadata.get("quelle", "Notiz")).execute()
                     
@@ -466,7 +476,7 @@ class DocumentIngestionPipeline:
             
             # Versuche document_metadata Insert
             try:
-                doc_ins = supabase.client.table("document_metadata").insert(doc_row).execute()
+                doc_ins = db.table("document_metadata").insert(doc_row).execute()
                 doc_id = doc_ins.data[0]["doc_id"]
                 logger.info(f"Inserted manual note into document_metadata: doc_id={doc_id}, has_schema={has_schema_support}")
             except Exception as e:
