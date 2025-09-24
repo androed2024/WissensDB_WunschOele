@@ -2746,21 +2746,21 @@ async def main():
             )
 
 
-    # Benutzerverwaltungs-Tab (vorletzter Tab - nur für admin)
-    if has_role("admin"):
-        # Berechne Index: letzter Tab wenn nur admin, vorletzter wenn auch delete-Tab da ist
-        if has_role("data_user", "admin"):
-            tab_index = len(tabs) - 2  # Vorletzter Tab (vor delete)
+    # Del-Tab (vorletzter Tab wenn verfügbar) 
+    if has_role("data_user", "admin"):
+        # Berechne Index: letzter Tab wenn nur delete, vorletzter wenn auch admin-Tab da ist
+        if has_role("admin"):
+            tab_index = len(tabs) - 2  # Vorletzter Tab (vor admin)
         else:
             tab_index = len(tabs) - 1  # Letzter Tab
         with tabs[tab_index]:
-            render_user_management()
+            await render_delete_preview_ui()
 
-    # Del-Tab (letzter Tab wenn verfügbar) 
-    if has_role("data_user", "admin"):
+    # Benutzerverwaltungs-Tab (letzter Tab - nur für admin)
+    if has_role("admin"):
         tab_index = len(tabs) - 1  # Letzter Tab
         with tabs[tab_index]:
-            await render_delete_preview_ui()
+            render_user_management()
 
 
 if __name__ == "__main__":
