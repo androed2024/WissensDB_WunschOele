@@ -192,17 +192,31 @@ class AgenticRetrievalOrchestrator:
             # Enhanced thematic diversity check for Cross-Source detection
             queries_so_far = sub_queries[:round_num]
             
-            # Classify query themes more intelligently
+            # Classify query themes more intelligently (generic approach)
             def classify_query_theme(query):
                 query_upper = query.upper()
-                if 'TRGS' in query_upper or 'NITRIT' in query_upper or 'GRENZWERT' in query_upper:
+                
+                # Generic regulatory/compliance indicators
+                regulation_terms = ['VORSCHRIFT', 'STANDARD', 'NORM', 'REGEL', 'GESETZ', 'VERORDNUNG', 
+                                  'COMPLIANCE', 'ZERTIFIZIERUNG', 'ANFORDERUNG', 'BESTIMMUNG']
+                if any(term in query_upper for term in regulation_terms):
                     return 'REGULATIONS'  # Regulatory/compliance topics
-                elif 'BOAT' in query_upper or 'SYNTH' in query_upper or any(oil_term in query_upper for oil_term in ['ÖL', 'OIL', 'MOTOR']):
-                    return 'PRODUCT'  # Product-specific topics  
-                else:
-                    # Fallback to first two words
-                    words = query.split()[:2]
-                    return ' '.join(words).upper()
+                
+                # Generic product/technical indicators  
+                product_terms = ['PRODUKT', 'ARTIKEL', 'MODELL', 'TYP', 'SERIE', 'VERSION',
+                               'TECHNISCH', 'SPEZIFIKATION', 'EIGENSCHAFT', 'PARAMETER']
+                if any(term in query_upper for term in product_terms):
+                    return 'PRODUCT'  # Product-specific topics
+                
+                # Generic process/procedure indicators
+                process_terms = ['PROZESS', 'VERFAHREN', 'ABLAUF', 'SCHRITT', 'VORGANG', 
+                               'ANLEITUNG', 'INSTALLATION', 'WARTUNG', 'BEDIENUNG']
+                if any(term in query_upper for term in process_terms):
+                    return 'PROCESS'  # Process-related topics
+                    
+                # Fallback to first two words
+                words = query.split()[:2]
+                return ' '.join(words).upper()
             
             executed_themes = set(classify_query_theme(q) for q in queries_so_far)
             all_planned_themes = set(classify_query_theme(q) for q in sub_queries)
@@ -334,17 +348,46 @@ class AgenticRetrievalOrchestrator:
             if response1.data:
                 metadata_matches.extend(response1.data)
             
-            # Strategy 2: Individual keyword matches (for "Wunsch BOAT SYNTH 2-T" -> ["BOAT", "SYNTH", "2-T"])
-            keywords = [word for word in sub_query.split() if len(word) > 2 and word not in ["der", "die", "das", "und", "oder", "für"]]
-            for keyword in keywords[:3]:  # Max 3 keywords to avoid too many hits
-                response2 = db.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
+            # Strategy 2: Product name extraction (for "Company Product ABC" -> extract "Product ABC")
+            import re
+            # Extract product names like "Product ABC", "Model XYZ", etc.
+            product_patterns = [
+                r'([A-Z][A-Z ]*[A-Z0-9-]+)',  # Uppercase words + numbers/dashes
+                r'([A-Z][a-z]+\w*\s+[A-Z0-9]+)',  # Mixed case product names
+            ]
+            
+            products_found = []
+            for pattern in product_patterns:
+                matches = re.findall(pattern, sub_query)
+                products_found.extend([m.strip() for m in matches if len(m.strip()) > 4])
+            
+            for product in products_found[:2]:  # Max 2 products
+                response2 = db.table("document_metadata").select("*").ilike("title", f"%{product}%").execute()
                 if response2.data:
                     for item in response2.data:
-                        # Avoid duplicates
                         if not any(existing['doc_id'] == item['doc_id'] for existing in metadata_matches):
+                            item['_match_score'] = 0.85  # High score for product matches
+                            item['_match_type'] = 'product_name'
                             metadata_matches.append(item)
+                    print(f"   ✅ Strategy 2: {len(response2.data)} product matches for '{product}'")
             
-            print(f"   📋 Document Metadata Search: {len(metadata_matches)} Titel-Treffer für '{sub_query}' (Keywords: {keywords})")
+            # Strategy 3: Fallback individual keywords (only if no product matches AND limited keywords)
+            if not metadata_matches:
+                keywords = [word for word in sub_query.split() if len(word) > 3 and word not in ["der", "die", "das", "und", "oder", "für", "Wunsch", "technische", "Eigenschaften", "Vorteile"]]
+                for keyword in keywords[:2]:  # Max 2 keywords and longer ones only
+                    response3 = db.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
+                    if response3.data:
+                        for item in response3.data:
+                            if not any(existing['doc_id'] == item['doc_id'] for existing in metadata_matches):
+                                item['_match_score'] = 0.4  # Lower score for individual keywords  
+                                item['_match_type'] = 'fallback_keyword'
+                                metadata_matches.append(item)
+                        print(f"   ⚠️ Strategy 3: {len(response3.data)} fallback keyword matches for '{keyword}'")
+            
+            # Sort by match score (if available) - higher scores first
+            metadata_matches.sort(key=lambda x: x.get('_match_score', 1.0), reverse=True)
+            
+            print(f"   📋 Document Metadata Search: {len(metadata_matches)} Titel-Treffer für '{sub_query}' (sorted by relevance)")
             
             # Convert metadata matches to chunks by fetching the actual content
             chunks = []

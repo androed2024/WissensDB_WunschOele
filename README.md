@@ -26,6 +26,35 @@ RAG_ENABLE_AGENTIC_FOR_NOTES=true
 RAG_NOTE_AGENTIC_MIN_TOKENS=300 # Schwelle für agentisches Chunking bei Notizen
 ```
 
+Always-On Agentic Retrieval
+I've successfully transformed your RAG solution to use "always-on" agentic retrieval with intelligent guards. Here's what has been implemented:
+
+🔧 Configuration Changes
+Removed all sidebar controls - The left column with parameter sliders is completely gone
+Hardcoded optimal parameters exactly as you specified:
+Max rounds: 2 (expandable to 3 via confidence gate)
+Candidates per round: 12
+Token budget: 2000
+Min similarity: 0.55
+Quality over speed: ON
+Recency half-life: 90 days
+Early stopping: 0.75
+
+🛡️ Intelligent Guards (Fully Automatic)
+
+Guard 1: Temporal-Cue-Switch
+Detects keywords like "heute", "aktuell", "neu", "neueste", "recent", "latest"
+Automatically reduces recency half-life from 90 → 30 days for time-sensitive queries
+
+Guard 2: Confidence-Gate
+If confidence < 0.5 after round 2, automatically triggers round 3
+Enhanced with more candidates, lower similarity threshold, and expanded search
+
+Guard 3: Recall-Boost
+If < 3 results found, automatically lowers min_similarity to 0.50 and increases candidates to 15
+Ensures no query goes unanswered due to overly strict filtering
+
+
 **Agentic Retrieval Parameters:**
 ```bash
 RAG_ROUNDS=3                    # Maximale Such-Runden
@@ -73,6 +102,34 @@ RAG_ENABLE_FILTERS=true         # Erweiterte Filter aktivieren
 - username: TEXT (Benutzer-ID)
 - created_at: TIMESTAMP
 ```
+
+ROLLEN-Konzept:
+
+Was wurde geändert:
+✅ Neue Rollenfunktionen implementiert:
+get_user_role() - gibt die eine Rolle des Users zurück
+has_permission(feature) - prüft hierarchische Berechtigungen
+✅ Alle 15 has_role() Aufrufe ersetzt durch:
+get_user_role() == "admin" für Admin-Prüfungen
+has_permission("chat") für Chat-Berechtigung
+has_permission("upload") für Upload-Berechtigung
+has_permission("delete") für Lösch-Berechtigung
+✅ UI-Verbesserungen in Benutzerverwaltung:
+Neuen User anlegen: 3 Checkboxes → 1 Radio Button Group
+Bestehende User bearbeiten: 3 Checkboxes → 1 Radio Button Group
+Benutzerfreundliche Beschreibungen der Rollen
+✅ Hierarchische Berechtigungen:
+Admin: kann alles (alle Features)
+Data User: kann Dokumente verwalten + chatten
+Chatbot User: kann nur chatten + Chat-Historie
+
+---
+
+Passwörter können Benutzer im User-Menü oben rechts selbst ändern.
+E-Mail-Recovery ist in dieser App nicht aktiv.
+Nach Rollen-Updates müssen betroffene Benutzer sich neu einloggen.
+Der Service-Client wird nur serverseitig verwendet.
+Alle RLS-Policies bleiben für normale Datenbankabfragen aktiv.
 
 ---
 

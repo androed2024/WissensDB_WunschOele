@@ -128,16 +128,29 @@ st.set_page_config(
     page_title="Wunsch Öle Wissens-Agent",
     page_icon="🔍",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",  # Hide sidebar since agentic retrieval is always-on
 )
 
-# CSS für kompakteres Layout
+# CSS für kompakteres Layout + Hidden Sidebar
 st.markdown(
     """
 <style>
 /* 1) Alles Top-Padding/Margin global entfernen */
 html, body { margin:0 !important; padding:0 !important; }
 #root, [data-testid="stAppViewContainer"] { margin:0 !important; padding-top:0 !important; }
+
+/* 2) Sidebar komplett verstecken (agentic retrieval ist always-on) */
+section[data-testid="stSidebar"] {
+    display: none !important;
+    width: 0 !important;
+    min-width: 0 !important;
+}
+.css-1d391kg {
+    display: none !important;
+}
+div[data-testid="collapsedControl"] {
+    display: none !important;
+}
 
 /* 2) Streamlit-Header, Toolbar, Deko und Status komplett entfernen (ohne reservierte Höhe) */
 header[data-testid="stHeader"],
@@ -224,9 +237,9 @@ def get_rag_agent():
     sb = get_db_client_for_admin_operations()
     return RAGAgent(db_client=sb)
 
-async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig) -> Dict[str, Any]:
+async def run_agentic_retrieval_with_guards(user_input: str, config: AgenticRetrievalConfig) -> Dict[str, Any]:
     """
-    Run agentic retrieval and return the result.
+    Run agentic retrieval with intelligent guards applied.
     
     Args:
         user_input: User's question
@@ -239,10 +252,48 @@ async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig)
     
     try:
         orchestrator = get_agentic_orchestrator()
+        
+        # First attempt with original config
         result = await orchestrator.run(user_input, config)
+        confidence = result.get('confidence', 0.0)
+        source_chunks = result.get('source_chunks', [])
+        
+        print(f"🎯 Erste Runde abgeschlossen. Confidence: {confidence}, Treffer: {len(source_chunks)}")
+        
+        # Guard 2: Confidence-Gate - if confidence < 0.5 after round 2, start round 3
+        if confidence < 0.5 and config.max_rounds >= 2:
+            print("🔄 Confidence-Gate: Confidence < 0.5 - starte erweiterte Runde 3")
+            
+            # Enhance the query with expanded search terms  
+            enhanced_config = AgenticRetrievalConfig(
+                max_rounds=3,  # Force round 3
+                k_per_round=config.k_per_round + 3,  # More candidates
+                token_budget=config.token_budget,
+                min_similarity=max(config.min_similarity - 0.05, 0.45),  # Slightly lower threshold
+                recency_halflife_days=config.recency_halflife_days,
+                doc_type_preference=config.doc_type_preference,
+                enable_filters=config.enable_filters,
+                early_stopping_threshold=0.65,  # Lower bar for acceptance
+                quality_over_speed=True  # Ensure thorough search
+            )
+            
+            # Run enhanced retrieval
+            result = await orchestrator.run(user_input, enhanced_config)
+            source_chunks = result.get('source_chunks', [])
+            print(f"🚀 Erweiterte Runde abgeschlossen. Neue Treffer: {len(source_chunks)}")
+        
+        # Guard 3: Recall-Boost for low results (applied retroactively if needed)  
+        if len(source_chunks) < 3:
+            print("🔍 Recall-Boost: Zu wenige Treffer - erweitere Suche")
+            recall_config = apply_recall_boost_if_needed(len(source_chunks), config)
+            if recall_config.min_similarity != config.min_similarity or recall_config.k_per_round != config.k_per_round:
+                # Re-run with boosted settings
+                result = await orchestrator.run(user_input, recall_config)
+                source_chunks = result.get('source_chunks', [])
+                print(f"✨ Recall-Boost abgeschlossen. Finale Treffer: {len(source_chunks)}")
         
         # Set last_match for UI compatibility (store in session_state for persistence)
-        st.session_state['last_agentic_matches'] = result.get('source_chunks', [])
+        st.session_state['last_agentic_matches'] = source_chunks
             
         return result
         
@@ -255,6 +306,11 @@ async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig)
             "source_chunks": [],
             "error": str(e)
         }
+
+# Backwards compatibility wrapper
+async def run_agentic_retrieval(user_input: str, config: AgenticRetrievalConfig) -> Dict[str, Any]:
+    """Backwards compatibility wrapper - now always uses guards."""
+    return await run_agentic_retrieval_with_guards(user_input, config)
 
 def _build_user_client(access_token: str):
     """Erzeuge einen Supabase-Client, der mit dem User-JWT gegen PostgREST authentifiziert ist (RLS greift)."""
@@ -439,120 +495,71 @@ def delete_user(uid: str):
 # ==== Ende Admin-Funktionen ====
 
 
-def render_agentic_config_sidebar():
-    """Render sidebar with agentic retrieval configuration."""
-    with st.sidebar:
-        st.markdown("## 🤖 Agentisches Retrieval")
-        
-        # Toggle for agentic retrieval
-        use_agentic = st.toggle(
-            "Aktiviere Agentisches Retrieval",
-            value=False,
-            key="use_agentic_retrieval",
-            help="Mehrstufige intelligente Suche mit Planung und Evidenz-Bündelung"
-        )
-        
-        if use_agentic:
-            st.markdown("### ⚙️ Konfiguration")
-            
-            # Max rounds
-            max_rounds = st.slider(
-                "Max. Such-Runden", 
-                min_value=1, 
-                max_value=6, 
-                value=2, 
-                key="agentic_max_rounds",
-                help="Maximale Anzahl der Such-Runden (2 für schnelle Antworten, 4+ für komplexe Cross-Source-Fragen)"
-            )
-            
-            # K per round
-            k_per_round = st.slider(
-                "Kandidaten pro Runde",
-                min_value=5,
-                max_value=30,
-                value=15,
-                key="agentic_k_per_round", 
-                help="Anzahl der Dokumente die pro Such-Runde abgerufen werden"
-            )
-            
-            # Token budget
-            token_budget = st.slider(
-                "Token-Budget",
-                min_value=500,
-                max_value=4000,
-                value=2000,
-                key="agentic_token_budget",
-                help="Maximale Tokens für den Kontext (ca. 1500 Wörter)"
-            )
-            
-            # Min similarity  
-            min_similarity = st.slider(
-                "Min. Ähnlichkeit",
-                min_value=0.1,
-                max_value=0.9,
-                value=0.55,
-                step=0.05,
-                key="agentic_min_sim",
-                help="Mindest-Ähnlichkeitsscore für Dokumente"
-            )
-            
-            # Speed vs Quality toggle (prominent placement)
-            quality_over_speed = st.toggle(
-                "🎯 Qualität über Geschwindigkeit",
-                value=False,
-                key="agentic_quality_over_speed",
-                help="Aktiviert: Vollständige Suche für beste Ergebnisse | Deaktiviert: Schnelle Antworten mit Early Stopping"
-            )
-            
-            # Advanced options in expander
-            with st.expander("🔧 Erweiterte Optionen"):
-                recency_halflife = st.number_input(
-                    "Recency Halflife (Tage)",
-                    min_value=1,
-                    max_value=365,
-                    value=30,
-                    key="agentic_recency_halflife",
-                    help="Halbwertszeit für Aktualitäts-Bonus in Tagen"
-                )
-                
-                doc_type_pref = st.selectbox(
-                    "Dokumenttyp-Präferenz",
-                    options=[None, "pdf", "txt", "manuell"],
-                    index=0,
-                    key="agentic_doc_type_pref",
-                    help="Bevorzugter Dokumenttyp (None = alle)"
-                )
-                
-                enable_filters = st.checkbox(
-                    "Erweiterte Filter aktivieren",
-                    value=True,
-                    key="agentic_enable_filters",
-                    help="Nutze Confidence-, Recency- und andere Filter"
-                )
-                
-                early_stopping_threshold = st.slider(
-                    "Early Stopping Threshold",
-                    min_value=0.6,
-                    max_value=0.9,
-                    value=0.75,
-                    step=0.05,
-                    key="agentic_early_stopping",
-                    help="Stoppe vorzeitig bei sehr guten Matches (höher = anspruchsvoller)"
-                )
-            
-            return AgenticRetrievalConfig(
-                max_rounds=max_rounds,
-                k_per_round=k_per_round,
-                token_budget=token_budget,
-                min_similarity=min_similarity,
-                recency_halflife_days=recency_halflife,
-                doc_type_preference=doc_type_pref,
-                enable_filters=enable_filters,
-                early_stopping_threshold=early_stopping_threshold,
-                quality_over_speed=quality_over_speed
-            )
-        
-        return None
+# Hardcoded agentic retrieval configuration - always enabled
+AGENTIC_DEFAULTS = {
+    "enabled": True,
+    "max_rounds": 2,
+    "candidates_per_round": 12,
+    "tool_token_budget": 2000,
+    "min_similarity": 0.55,
+    "quality_over_speed": True,
+    "recency_half_life_days": 90,
+    "doc_type_preference": None,
+    "advanced_filters": {"language": "de"},
+    "early_stopping_threshold": 0.75,
+    "retrieval": {
+        "initial_topk": 60,
+        "rerank_topk": 50,
+        "keep_topk": 8,
+        "max_chunks_per_source": 3,
+        "context_chunks": 5,
+        "context_token_cap": 1200
+    }
+}
+
+def apply_agentic_guards(query: str, base_config: AgenticRetrievalConfig) -> AgenticRetrievalConfig:
+    """Apply intelligent guards to adapt agentic configuration based on query characteristics."""
+    
+    # Guard 1: Temporal-Cue-Switch
+    temporal_keywords = re.compile(r'\b(heute|aktuell|neu|neuen|neueste|letztes? Jahr|vergangene|jüngste|rezent|current|latest|recent)\b', re.IGNORECASE)
+    if temporal_keywords.search(query):
+        print("🕒 Temporal-Cue-Switch: Reduziere Recency Half-life auf 30 Tage für zeitbezogene Anfrage")
+        base_config.recency_halflife_days = 30
+    
+    return base_config
+
+def apply_recall_boost_if_needed(results_count: int, base_config: AgenticRetrievalConfig) -> AgenticRetrievalConfig:
+    """Guard 3: Recall-Boost bei Nulltreffern - apply after initial search to boost recall."""
+    if results_count < 3:
+        print("🚀 Recall-Boost: Weniger als 3 Treffer - senke Min-Similarity und erhöhe Kandidaten")
+        base_config.min_similarity = 0.50
+        base_config.k_per_round = 15
+    
+    return base_config
+
+def get_always_on_agentic_config(query: str = "") -> AgenticRetrievalConfig:
+    """Get the always-on agentic retrieval configuration with intelligent guards."""
+    
+    # Create base configuration
+    config = AgenticRetrievalConfig(
+        max_rounds=AGENTIC_DEFAULTS["max_rounds"],
+        k_per_round=AGENTIC_DEFAULTS["candidates_per_round"],
+        token_budget=AGENTIC_DEFAULTS["tool_token_budget"],
+        min_similarity=AGENTIC_DEFAULTS["min_similarity"],
+        recency_halflife_days=AGENTIC_DEFAULTS["recency_half_life_days"],
+        doc_type_preference=AGENTIC_DEFAULTS["doc_type_preference"],
+        enable_filters=True,
+        early_stopping_threshold=AGENTIC_DEFAULTS["early_stopping_threshold"],
+        quality_over_speed=AGENTIC_DEFAULTS["quality_over_speed"]
+    )
+    
+    # Apply intelligent guards
+    if query:
+        config = apply_agentic_guards(query, config)
+    
+    print(f"🤖 Agentisches Retrieval (Always-On) - Konfiguration: max_rounds={config.max_rounds}, k_per_round={config.k_per_round}, min_similarity={config.min_similarity}, recency_halflife={config.recency_halflife_days}")
+    
+    return config
 
 
 if "messages" not in st.session_state:
@@ -992,8 +999,8 @@ async def main():
     await update_available_sources()
     render_header()
     
-    # Render agentic config sidebar and get config
-    agentic_config = render_agentic_config_sidebar()
+    # Always-on agentic retrieval configuration (no sidebar needed)
+    # agentic_config = render_agentic_config_sidebar()  # REMOVED - always on now
 
     doc_count = st.session_state.get("document_count", 0)
     note_count = st.session_state.get("knowledge_count", 0)
@@ -1144,11 +1151,8 @@ async def main():
         # Hinweise
         with st.expander("Hinweise", expanded=True):
             st.markdown("- Passwörter können Benutzer im User-Menü oben rechts selbst ändern.")
-            st.markdown("- E-Mail-Recovery ist in dieser App nicht aktiv.")
             st.markdown("- Nach Rollen-Updates müssen betroffene Benutzer sich neu einloggen.")
-            st.markdown("- Der Service-Client wird nur serverseitig verwendet.")
-            st.markdown("- Alle RLS-Policies bleiben für normale Datenbankabfragen aktiv.")
-
+            
     async def render_delete_preview_ui():
         """Renders the complete document/note preview and delete UI."""
         # Custom CSS for better text readability in preview areas
@@ -1602,42 +1606,19 @@ async def main():
                     message_placeholder = st.empty()
                     full_response = ""
 
-                    # Choose between agentic and classic retrieval
-                    rag_agent = None  # Initialize for source processing
-                    
-                    if agentic_config is not None:
-                        # Use agentic retrieval (silently in background)
-                        agentic_result = await run_agentic_retrieval(user_input, agentic_config)
-                        full_response = agentic_result.get("answer", "")
-                        message_placeholder.markdown(full_response)
-                        
-                    else:
-                        # Use classic streaming retrieval
-                        rag_agent = get_rag_agent()  # Only needed for classic retrieval
-                        
-                        # Reset akkumulierte Treffer für neue Frage (aber nicht None setzen!)
-                        if hasattr(rag_agent, "last_match"):
-                            rag_agent.last_match = []
-                            print(f"🔄 Reset: Treffer-Akkumulator für neue Frage geleert")
-
-                        async for chunk in run_agent_with_streaming(user_input, rag_agent):
-                            full_response += chunk
-                            message_placeholder.markdown(full_response + "▌")
+                    # Always use agentic retrieval (always-on configuration)
+                    agentic_config = get_always_on_agentic_config(user_input)
+                    agentic_result = await run_agentic_retrieval(user_input, agentic_config)
+                    full_response = agentic_result.get("answer", "")
+                    message_placeholder.markdown(full_response)
 
                     # Chatbot Interface - Quellenangaben verarbeiten
                     pdf_sources = defaultdict(set)
                     txt_sources = defaultdict(set)
                     note_sources = defaultdict(set)
 
-                    # Check for sources from both classic and agentic retrieval
-                    source_chunks = []
-                    
-                    # Classic retrieval sources
-                    if hasattr(rag_agent, "last_match") and rag_agent.last_match:
-                        source_chunks = rag_agent.last_match
-                    # Agentic retrieval sources
-                    elif agentic_config is not None and 'last_agentic_matches' in st.session_state:
-                        source_chunks = st.session_state['last_agentic_matches']
+                    # Get sources from agentic retrieval (always-on)
+                    source_chunks = st.session_state.get('last_agentic_matches', [])
                     
                     if source_chunks:
                         print("--- Treffer im Retrieval ---")
@@ -1671,10 +1652,37 @@ async def main():
                         
                         has_cross_source = len(unique_sources) > 1 or metadata_matches > 0
                         
-                        if has_cross_source:
-                            # Less aggressive filtering for cross-source queries
-                            RELEVANCE_GAP_THRESHOLD = 0.20  # More lenient: 20% gap allowed
-                            print("🔄 Cross-Source detected: Using lenient filtering")
+                        # Generic Cross-Entity Detection: Adaptive threshold based on score distribution
+                        # This works for any domain (products, processes, orders, etc.)
+                        
+                        is_mixed_relevance = False
+                        
+                        if len(all_matches) >= 2:
+                            scores = [sim for match, sim in all_matches]
+                            scores.sort(reverse=True)
+                            
+                            # Calculate score distribution metrics
+                            top_score = scores[0]
+                            second_score = scores[1] if len(scores) > 1 else 0
+                            score_gap = top_score - second_score
+                            
+                            # Large score gap suggests the top result is clearly better 
+                            # and lower results might be from different entities/contexts
+                            LARGE_GAP_THRESHOLD = 0.15  # 15% gap indicates clear winner
+                            
+                            if score_gap > LARGE_GAP_THRESHOLD:
+                                is_mixed_relevance = True
+                                print(f"📊 Mixed relevance detected: Top score {top_score:.3f} vs {second_score:.3f} (gap: {score_gap:.3f})")
+                        
+                        if is_mixed_relevance:
+                            # Stricter filtering when there's a clear quality gap
+                            # This prevents lower-quality cross-entity matches from appearing
+                            RELEVANCE_GAP_THRESHOLD = 0.12  # Stricter: 12% gap for clear separation
+                            print("🔒 Mixed relevance: Using stricter filtering to prevent cross-entity confusion")
+                        elif has_cross_source:
+                            # Standard cross-source filtering (different doc types, but same product)
+                            RELEVANCE_GAP_THRESHOLD = 0.15  # Moderate: 15% gap allowed
+                            print("🔄 Cross-Source detected: Using moderate filtering")
                         else:
                             # Standard filtering for single-source queries
                             RELEVANCE_GAP_THRESHOLD = 0.13  # Standard: 13% gap
@@ -1778,7 +1786,7 @@ async def main():
                         )
 
                     # Füge saubere Quellenangaben hinzu
-                    retrieval_type = "Agentisch" if agentic_config is not None else "Klassisch"
+                    retrieval_type = "Agentisch (Always-On)"
                     print(f"🔍 Debug ({retrieval_type}): PDF-Quellen gefunden: {dict(pdf_sources)}")
                     print(f"🔍 Debug ({retrieval_type}): TXT-Quellen gefunden: {dict(txt_sources)}")
                     print(f"🔍 Debug ({retrieval_type}): Notiz-Quellen gefunden: {dict(note_sources)}")

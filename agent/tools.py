@@ -222,6 +222,10 @@ class KnowledgeBaseSearch:
                     
         results = filtered_results[: params.max_results]
 
+        # Source Expansion: Add more chunks from same documents for better context  
+        expanded_results = await self._expand_source_context(results, params.max_results)
+        results = expanded_results
+
         print("\n📊 Reranker-Scores:")
         for i, r in enumerate(results[: params.max_results]):
             sim = r.get("similarity", -1)
@@ -322,28 +326,92 @@ class KnowledgeBaseSearch:
         """
         Search in document_metadata table for title matches as final fallback.
         Returns results in the same format as regular search.
+        Improved version with better relevance scoring and specificity.
         """
         try:
             print(f"   🔍 Fallback-Metadaten-Suche: '{query}'")
             
             metadata_matches = []
             
-            # Strategy 1: Full query match
+            # Strategy 1: Full query match (highest priority)
             response1 = self.db_client.table("document_metadata").select("*").ilike("title", f"%{query}%").execute()
             if response1.data:
+                for item in response1.data:
+                    item['_match_score'] = 1.0  # Highest score for complete matches
+                    item['_match_type'] = 'complete_query'
                 metadata_matches.extend(response1.data)
+                print(f"   ✅ Strategy 1: {len(response1.data)} complete query matches")
             
-            # Strategy 2: Individual keyword matches (for "Wunsch BOAT SYNTH 2-T" -> ["BOAT", "SYNTH", "2-T"])
-            keywords = [word for word in query.split() if len(word) > 2 and word not in ["der", "die", "das", "und", "oder", "für", "Wunsch"]]
-            for keyword in keywords[:3]:  # Max 3 keywords to avoid too many hits
-                response2 = self.db_client.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
-                if response2.data:
-                    for item in response2.data:
-                        # Avoid duplicates
-                        if not any(existing['doc_id'] == item['doc_id'] for existing in metadata_matches):
-                            metadata_matches.append(item)
+            # Only proceed with partial matching if no complete matches found
+            if not metadata_matches:
+                print("   🔄 No complete matches, trying product name extraction...")
+                
+                # Strategy 2: Extract and search for complete product names
+                # Look for quoted product names or specific patterns like "Product XYZ"
+                product_patterns = []
+                
+                # Pattern 1: Extract quoted product names
+                import re
+                quoted_matches = re.findall(r'"([^"]+)"', query)
+                product_patterns.extend(quoted_matches)
+                
+                # Pattern 2: Detect product-like patterns (CAPS + numbers/hyphens)
+                product_match = re.search(r'\b([A-Z]+(?:\s+[A-Z0-9-]+)*)\b', query)
+                if product_match:
+                    product_patterns.append(product_match.group(1))
+                
+                # Search for complete product patterns
+                for pattern in product_patterns:
+                    if pattern and len(pattern.strip()) > 3:
+                        response2 = self.db_client.table("document_metadata").select("*").ilike("title", f"%{pattern}%").execute()
+                        if response2.data:
+                            for item in response2.data:
+                                if not any(existing['doc_id'] == item['doc_id'] for existing in metadata_matches):
+                                    item['_match_score'] = 0.9  # High score for product name matches
+                                    item['_match_type'] = 'product_name'
+                                    metadata_matches.append(item)
+                            print(f"   ✅ Strategy 2: {len(response2.data)} product name matches for '{pattern}'")
             
-            print(f"   📋 Metadata Fallback: {len(metadata_matches)} Titel-Treffer (Keywords: {keywords})")
+            # Strategy 3: Multi-keyword combination (only if still no matches)
+            if not metadata_matches:
+                print("   🔄 No product matches, trying keyword combinations...")
+                keywords = [word for word in query.split() if len(word) > 2 and word not in ["der", "die", "das", "und", "oder", "für", "technische", "Eigenschaften", "Vorteile", "Leistungsmerkmale"]]
+                
+                if len(keywords) >= 2:
+                    # Try combinations of 2+ keywords
+                    for i in range(len(keywords)):
+                        for j in range(i+1, len(keywords)):
+                            combo_pattern = f"%{keywords[i]}%{keywords[j]}%"
+                            response3 = self.db_client.table("document_metadata").select("*").ilike("title", combo_pattern).execute()
+                            if response3.data:
+                                for item in response3.data:
+                                    if not any(existing['doc_id'] == item['doc_id'] for existing in metadata_matches):
+                                        item['_match_score'] = 0.7  # Medium score for keyword combinations
+                                        item['_match_type'] = 'keyword_combo'
+                                        metadata_matches.append(item)
+                                print(f"   ✅ Strategy 3: {len(response3.data)} combo matches for '{keywords[i]}' + '{keywords[j]}'")
+            
+            # Strategy 4: Individual keywords (only as last resort and with lower scores)
+            if not metadata_matches:
+                print("   ⚠️ Last resort: trying individual keywords...")
+                keywords = [word for word in query.split() if len(word) > 3 and word not in ["der", "die", "das", "und", "oder", "für", "technische", "Eigenschaften", "Vorteile", "Leistungsmerkmale", "Daten"]]
+                
+                for keyword in keywords[:2]:  # Max 2 keywords and only longer ones
+                    response4 = self.db_client.table("document_metadata").select("*").ilike("title", f"%{keyword}%").execute()
+                    if response4.data:
+                        for item in response4.data:
+                            if not any(existing['doc_id'] == item['doc_id'] for existing in metadata_matches):
+                                # Calculate relevance based on keyword importance
+                                score = 0.4 if len(keyword) > 4 else 0.3  # Longer keywords get higher scores
+                                item['_match_score'] = score
+                                item['_match_type'] = 'single_keyword'
+                                metadata_matches.append(item)
+                        print(f"   ⚠️ Strategy 4: {len(response4.data)} single keyword matches for '{keyword}' (score: {score})")
+            
+            # Sort by match score (highest first)
+            metadata_matches.sort(key=lambda x: x.get('_match_score', 0), reverse=True)
+            
+            print(f"   📋 Metadata Fallback: {len(metadata_matches)} Titel-Treffer (sorted by relevance)")
             
             # Convert metadata matches to search result format
             results = []
@@ -351,8 +419,10 @@ class KnowledgeBaseSearch:
                 doc_title = doc_meta.get("title", "")
                 source_url = doc_meta.get("source_url", "")
                 doc_type = doc_meta.get("doc_type", "")
+                match_score = doc_meta.get('_match_score', 0.5)
+                match_type = doc_meta.get('_match_type', 'unknown')
                 
-                print(f"   🎯 Metadata Match: '{doc_title}' -> {source_url}")
+                print(f"   🎯 Metadata Match: '{doc_title}' -> {source_url} (score: {match_score:.2f}, type: {match_type})")
                 
                 # Fetch actual content chunks from this document
                 content_response = self.db_client.table("rag_pages").select("*").eq("url", source_url).limit(5).execute()
@@ -365,7 +435,7 @@ class KnowledgeBaseSearch:
                         doc_title,  # Original title
                         doc_title.replace('"', ''),  # Remove quotes
                         doc_title.replace('"', '"').replace('"', '"'),  # Smart quotes
-                        f'Info zu Öl "{doc_title.split('"')[1]}"' if '"' in doc_title else doc_title,  # Format variants
+                        f'Info zu "{doc_title.split('"')[1]}"' if '"' in doc_title else doc_title,  # Format variants
                     ]
                     
                     for variant in title_variants:
@@ -380,21 +450,22 @@ class KnowledgeBaseSearch:
                 
                 if content_response.data:
                     for chunk_data in content_response.data:
-                        # Convert to standard search result format
+                        # Convert to standard search result format with improved scoring
                         result = {
                             "content": chunk_data.get("content", ""),
                             "url": source_url,
-                            "similarity": 0.80,  # Good score for title matches - consistent with agentic
+                            "similarity": match_score,  # Use calculated match score instead of fixed 0.80
                             "metadata": chunk_data.get("metadata", {}),
                             "source_type": "metadata_fallback",
                             "page": chunk_data.get("page", 1),
                             "page_heading": chunk_data.get("page_heading", ""),
                             "section_heading": chunk_data.get("section_heading", ""),
                             "token_count": chunk_data.get("token_count", 0),
-                            "confidence": chunk_data.get("confidence", 0.8),
+                            "confidence": match_score,  # Use match score as confidence
                             "created_at": doc_meta.get("created_at", ""),
                             "file_modified_at": doc_meta.get("file_modified_at", ""),
                             "metadata_title_match": doc_title,  # Mark as metadata match
+                            "metadata_match_type": match_type,  # Add match type for debugging
                             "doc_type": doc_type
                         }
                         results.append(result)
@@ -447,3 +518,72 @@ class KnowledgeBaseSearch:
             result = self.db_client.table("rag_pages").select("url").execute()
             urls = set(item["url"] for item in result.data if result.data)
             return list(urls)
+    
+    async def _expand_source_context(self, results: List[Dict[str, Any]], max_total: int) -> List[Dict[str, Any]]:
+        """
+        Expand context by adding more chunks from the same sources.
+        This helps with fragmented information in PDFs/documents.
+        """
+        if not results:
+            return results
+            
+        print(f"🔍 Source-Expansion: Erweitere Kontext für {len(results)} Treffer...")
+        
+        # Group results by source URL
+        sources_with_good_matches = {}
+        for result in results:
+            url = result.get("url", "")
+            if url and result.get("similarity", 0) >= 0.55:  # Expand good matches (aligned with min_similarity)
+                if url not in sources_with_good_matches:
+                    sources_with_good_matches[url] = []
+                sources_with_good_matches[url].append(result)
+        
+        expanded_results = list(results)  # Start with original results
+        
+        # For each source with good matches, fetch additional chunks
+        for source_url, source_results in sources_with_good_matches.items():
+            if len(expanded_results) >= max_total:
+                break
+                
+            try:
+                # Get all chunks from this document
+                response = self.db_client.table("rag_pages").select("*").eq("url", source_url).order("chunk_number").limit(8).execute()
+                
+                if response.data:
+                    print(f"   🔄 Erweitere {source_url}: +{len(response.data)} Chunks aus Dokument")
+                    
+                    for chunk_data in response.data:
+                        # Skip if already in results
+                        chunk_id = chunk_data.get("id")
+                        if any(r.get("id") == chunk_id for r in expanded_results):
+                            continue
+                        
+                        # Add with slightly lower score to maintain ranking
+                        expanded_chunk = {
+                            "content": chunk_data.get("content", ""),
+                            "url": source_url,
+                            "similarity": 0.55,  # Context chunks get decent score
+                            "metadata": chunk_data.get("metadata", {}),
+                            "source_type": "context_expansion",
+                            "page": chunk_data.get("page", 1),
+                            "page_heading": chunk_data.get("page_heading", ""),
+                            "section_heading": chunk_data.get("section_heading", ""),
+                            "token_count": chunk_data.get("token_count", 0),
+                            "confidence": 0.6,
+                            "id": chunk_id,
+                            "chunk_number": chunk_data.get("chunk_number", 0)
+                        }
+                        
+                        expanded_results.append(expanded_chunk)
+                        
+                        if len(expanded_results) >= max_total:
+                            break
+                            
+            except Exception as e:
+                print(f"   ⚠️ Source-Expansion Fehler für {source_url}: {e}")
+        
+        # Sort by similarity, but keep context chunks together
+        expanded_results.sort(key=lambda x: (x.get("similarity", 0), -x.get("chunk_number", 999)), reverse=True)
+        
+        print(f"   ✅ Source-Expansion: {len(results)} → {len(expanded_results)} Chunks")
+        return expanded_results[:max_total]
